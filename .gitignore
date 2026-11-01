@@ -1,0 +1,17 @@
+/target/
+/tmp/
+/output/
+__pycache__/
+/submit/
+# Only public-domain paintings are kept; other pictures stay local.
+/assets/paintings/*
+!/assets/paintings/adam.jpg
+!/assets/paintings/gleizes.jpg
+!/assets/paintings/SOURCES.md
+/assets/private/
+# Personal details (name, student ID, email); see personal.example.json.
+/personal.json
+# Kept locally but left out of the public package: the course handout
+# (the instructor's material) and working notes.
+/Assignment_1151.pdf
+/.scratch/

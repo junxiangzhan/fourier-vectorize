@@ -1,0 +1,57 @@
+# Builds and tests the program, runs every experiment and the painting
+# showcase on the paintings kept in the repository (The Creation of Adam,
+# public domain), audits the results independently and uploads them.
+# The report PDFs are not built here.
+name: experiments
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      hifi:
+        description: Also run the high-fidelity comparison (about 40 minutes on a hosted runner)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Pillow (JPEG decoding and the audit)
+        run: python -m pip install "pillow>=12,<13"
+
+      - name: Test
+        run: cargo test --release --offline
+
+      - name: Decode the paintings (JPEG to BMP, no resizing)
+        run: python scripts/decode_paintings.py assets/paintings
+
+      - name: Run every experiment and the painting showcase
+        run: cargo run --release --offline -- all --out output --size 384 --wedges 96 --paintings assets/paintings
+
+      - name: High-fidelity comparison
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.hifi }}
+        run: cargo run --release --offline -- hifi --out output --paintings assets/paintings
+
+      - name: Independent audit
+        run: python scripts/audit.py output
+
+      - name: Upload the results
+        uses: actions/upload-artifact@v4
+        with:
+          name: experiment-output
+          path: output/
+          retention-days: 30
