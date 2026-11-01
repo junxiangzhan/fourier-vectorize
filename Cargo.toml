@@ -1,0 +1,15 @@
+[package]
+name = "multimedia"
+version = "0.1.0"
+edition = "2021"
+description = "Bézier geometry, winding rasterization and supersampling for Assignment 1151"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# The Part 4 vectorizer runs gradient descent per outline; without
+# optimization the CLI integration test takes minutes.
+[profile.dev]
+opt-level = 2

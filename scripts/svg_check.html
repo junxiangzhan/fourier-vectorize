@@ -1,0 +1,88 @@
+<!doctype html>
+<!--
+  Browser check for the Lab SVGs (Part 4). Serve the repository root over
+  HTTP (python -m http.server) and open
+    scripts/svg_check.html?stem=paint_adam_lab1266
+  The page draws <stem>_browser.svg (rendered by this browser, filter and
+  all) and <stem>_vector.bmp (our own rasterizer) onto canvases of the same
+  size and compares them pixel by pixel in CIE76 ΔE.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab SVG check</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; background: #fff; color: #17354a; }
+  canvas { max-width: 100%; border: 1px solid #ccc; margin: 4px 0; }
+  pre { background: #f3f6f8; padding: 8px; }
+</style>
+</head>
+<body>
+<h1>Lab SVG check</h1>
+<pre id="result">loading…</pre>
+<div><canvas id="browser"></canvas> <canvas id="ours"></canvas></div>
+<script>
+const params = new URLSearchParams(location.search);
+const stem = params.get('stem') || 'paint_adam_lab1266';
+const base = params.get('base') || '../output/';
+
+function load(src) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('cannot load ' + src));
+    image.src = src;
+  });
+}
+
+// sRGB (0..255) to CIE Lab, D65, the same formula as the Rust program.
+function lab(r, g, b) {
+  const lin = [r, g, b].map(v => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); });
+  const x = (0.4124 * lin[0] + 0.3576 * lin[1] + 0.1805 * lin[2]) / 0.95047;
+  const y = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
+  const z = (0.0193 * lin[0] + 0.1192 * lin[1] + 0.9505 * lin[2]) / 1.08883;
+  const f = t => t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116;
+  return [116 * f(y) - 16, 500 * (f(x) - f(y)), 200 * (f(y) - f(z))];
+}
+
+function pixels(id, image) {
+  const canvas = document.getElementById(id);
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+  const context = canvas.getContext('2d');
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return context.getImageData(0, 0, canvas.width, canvas.height).data;
+}
+
+(async () => {
+  const out = document.getElementById('result');
+  try {
+    const [svg, bmp] = await Promise.all([load(base + stem + '_browser.svg'), load(base + stem + '_vector.bmp')]);
+    if (svg.naturalWidth !== bmp.naturalWidth || svg.naturalHeight !== bmp.naturalHeight) {
+      throw new Error(`size mismatch: svg ${svg.naturalWidth}x${svg.naturalHeight}, bmp ${bmp.naturalWidth}x${bmp.naturalHeight}`);
+    }
+    const a = pixels('browser', svg);
+    const b = pixels('ours', bmp);
+    let sum = 0, worst = 0, over2 = 0, over5 = 0;
+    const n = a.length / 4;
+    for (let i = 0; i < a.length; i += 4) {
+      const p = lab(a[i], a[i + 1], a[i + 2]);
+      const q = lab(b[i], b[i + 1], b[i + 2]);
+      const d = Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]);
+      sum += d;
+      worst = Math.max(worst, d);
+      if (d > 2) over2++;
+      if (d > 5) over5++;
+    }
+    const result = { stem, width: svg.naturalWidth, height: svg.naturalHeight, mean_delta_e: +(sum / n).toFixed(4), max_delta_e: +worst.toFixed(3), share_over_2: +(over2 / n).toFixed(5), share_over_5: +(over5 / n).toFixed(5), userAgent: navigator.userAgent };
+    window.checkResult = result;
+    out.textContent = JSON.stringify(result, null, 2);
+  } catch (error) {
+    window.checkResult = { stem, error: String(error) };
+    out.textContent = String(error);
+  }
+})();
+</script>
+</body>
+</html>
