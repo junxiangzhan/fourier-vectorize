@@ -1,5 +1,5 @@
 //! Command-line entry point.
-use fourier_vectorize::{fit_image, render, Error, FitKind, FitOptions, Prune, PruneBy, SvgDetail};
+use fourier_vectorize::{fit_image, pack, render, Error, FitKind, FitOptions, Prune, PruneBy, SvgDetail};
 use std::{path::PathBuf, str::FromStr};
 
 const HELP: &str = "\
@@ -13,8 +13,12 @@ fourier-vectorize fit IMAGE... [--out DIR] [--factor N] [--levels 32,16,16] [--m
     costs accuracy. --prune picks them by size (largest, default) or lowest harmonics (lowpass);
     --rounds cuts in N equal ratios (default 1, all at once); --prune-steps is the total descent
     (default 400): half over the rounds, half on the final set. The file name records all of these.
-fourier-vectorize render COEFFICIENTS.csv... [--out DIR] [--scale N] [--svg] [--bmp] [--tolerance PX] [--decimals N]
-    Draw coefficients written by `fit` as a browser SVG and/or a BMP, N times larger (default 1, both
+fourier-vectorize pack COEFFICIENTS.csv... [--out DIR] [--movement PX]
+    Pack coefficients written by `fit` into <name>_m<PX>.fvc, a small binary file that needs nothing
+    else to be drawn. --movement is how far rounding the coefficients may move each curve, as an RMS
+    in pixels (default 0.2), which costs accuracy.
+fourier-vectorize render FILE... [--out DIR] [--scale N] [--svg] [--bmp] [--tolerance PX] [--decimals N]
+    Draw coefficients written by `fit` or `pack` as a browser SVG and/or a BMP, N times larger (default 1, both
     files). SVG only: --tolerance is how far simplifying may move an outline, in output pixels
     (default 0.1; 0 drops only points exactly in line); --decimals is the coordinates' decimal places,
     0..4 (default 1). Other values go in the SVG's file name.
@@ -23,6 +27,7 @@ The default output directory is the current one.";
 
 enum Job {
     Fit(FitOptions),
+    Pack { movement: f64 },
     Render { scale: usize, svg: Option<SvgDetail>, bmp: bool },
 }
 
@@ -40,14 +45,15 @@ fn value<T: FromStr>(args: &mut impl Iterator<Item = String>, message: &'static 
 /// Parses the arguments; Ok(None) means the help was printed.
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, Error> {
     let command = args.next();
-    let is_fit = match command.as_deref() {
-        Some("fit") => true,
-        Some("render") => false,
+    let (is_fit, is_pack) = match command.as_deref() {
+        Some("fit") => (true, false),
+        Some("pack") => (false, true),
+        Some("render") => (false, false),
         None | Some("--help") | Some("-h") => {
             println!("{HELP}");
             return Ok(None);
         }
-        _ => return Err(Error::InvalidParameter("the command is fit or render; use --help")),
+        _ => return Err(Error::InvalidParameter("the command is fit, pack or render; use --help")),
     };
     let mut output = PathBuf::from(".");
     let mut files = Vec::new();
@@ -57,6 +63,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, Error
     let (mut scale, mut svg, mut bmp) = (1, false, false);
     let mut detail = SvgDetail::default();
     let mut detail_option = false;
+    let mut movement = 0.2;
+    let is_render = !is_fit && !is_pack;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -114,15 +122,15 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, Error
                 prune.steps = value(&mut args, "--prune-steps needs an integer")?;
                 prune_option = true;
             }
-            "--scale" if !is_fit => {
+            "--scale" if is_render => {
                 scale = value(&mut args, "--scale needs an integer in 1..16")?;
                 if !(1..=16).contains(&scale) {
                     return Err(Error::InvalidParameter("--scale needs an integer in 1..16"));
                 }
             }
-            "--svg" if !is_fit => svg = true,
-            "--bmp" if !is_fit => bmp = true,
-            "--tolerance" if !is_fit => {
+            "--svg" if is_render => svg = true,
+            "--bmp" if is_render => bmp = true,
+            "--tolerance" if is_render => {
                 let message = "--tolerance needs a distance of at least 0 pixels";
                 detail.tolerance = value(&mut args, message)?;
                 if !(detail.tolerance.is_finite() && detail.tolerance >= 0.0) {
@@ -130,19 +138,26 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, Error
                 }
                 detail_option = true;
             }
-            "--decimals" if !is_fit => {
+            "--decimals" if is_render => {
                 detail.decimals = value(&mut args, "--decimals needs an integer in 0..4")?;
                 if detail.decimals > 4 {
                     return Err(Error::InvalidParameter("--decimals needs an integer in 0..4"));
                 }
                 detail_option = true;
             }
+            "--movement" if is_pack => {
+                let message = "--movement needs a distance above 0 pixels";
+                movement = value(&mut args, message)?;
+                if !(movement > 0.0 && f64::is_finite(movement)) {
+                    return Err(Error::InvalidParameter(message));
+                }
+            }
             _ if arg.starts_with('-') => return Err(Error::InvalidParameter("unknown argument for this command; use --help")),
             _ => files.push(PathBuf::from(arg)),
         }
     }
     if files.is_empty() {
-        return Err(Error::InvalidParameter("fit needs images and render needs coefficient files; use --help"));
+        return Err(Error::InvalidParameter("fit needs images; pack and render need coefficient files; use --help"));
     }
     let job = if is_fit {
         if prune_option && prune.keep >= 1.0 {
@@ -150,6 +165,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, Error
         }
         options.prune = (prune.keep < 1.0).then_some(prune);
         Job::Fit(options)
+    } else if is_pack {
+        Job::Pack { movement }
     } else {
         if detail_option && bmp && !svg {
             return Err(Error::InvalidParameter("--tolerance and --decimals only change the SVG; a BMP is filled from the series"));
@@ -171,6 +188,9 @@ fn run() -> Result<(), Error> {
         match &config.job {
             Job::Fit(options) => {
                 println!("Fitted: {}", fit_image(&config.output, file, options)?.display());
+            }
+            Job::Pack { movement } => {
+                println!("Packed: {}", pack(&config.output, file, *movement)?.display());
             }
             Job::Render { scale, svg, bmp } => {
                 for written in render(&config.output, file, *scale, *svg, *bmp)? {

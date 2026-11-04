@@ -48,10 +48,33 @@ fourier-vectorize render output/photo_refined_coefficients.csv --svg --out outpu
 | `fit --prune-steps N` | 梯度下降總步數：一半分給各輪，一半留給最後的係數集 | 400 | |
 | `render --tolerance PX` | 簡化 SVG 輪廓時可移動的距離（輸出像素）；0 只刪完全共線的點 | 0.1 | 是 |
 | `render --decimals N` | SVG 座標小數位數（0..4） | 1 | 是 |
+| `pack --movement PX` | 把係數檔壓成二進位，量化讓每條輪廓移動約這個 RMS 距離（像素） | 0.2 | 是 |
 
 SVG 一律使用相對座標，這一步本身不損失資訊。設定會記錄在檔名裡（如 `photo_refined_keep0.17_largest_r8_s400_coefficients.csv`、`photo_refined_t0.5_d0.svg`），不同設定不會互相覆蓋。BMP 直接由級數填色，不受 `--tolerance` 與 `--decimals` 影響。
 
 在兩幅畫上的實驗（各 4 個比例）：保留約 11% 以上時，多輪略優（如 8 輪、400 步保留約 17%）；約 7% 以下則一次刪的色差較小。選法則因畫而異。樣本很少，只能當起點參考。
+
+## 壓縮係數
+
+`pack` 把 `fit` 的 CSV 壓成 `.fvc`：把係數量化成整數，再用 LZMA2 壓縮。這個檔案本身就含畫布尺寸和基底階數，`render` 只需要它就能畫，不用 CSV 和 JSON。
+
+```bash
+fourier-vectorize pack output/photo_refined_coefficients.csv --out output --movement 0.2
+fourier-vectorize render output/photo_refined_m0.2.fvc --svg --out output
+```
+
+瀏覽器不能直接開 `.fvc`，要顯示時用 `render` 輸出 SVG。
+
+在兩幅畫上量到的大小與平均 ΔE（未刪減係數，預設階數）：
+
+| `--movement` | 960×1247 的畫 | 1762×799 的畫 |
+|---|---|---|
+| 不壓縮（CSV） | 36.9 MB，1.994 | 54.1 MB，2.278 |
+| 0.1 | 0.50 MB，2.002 | 0.86 MB，2.284 |
+| 0.2 | 0.36 MB，2.020 | 0.64 MB，2.303 |
+| 0.4 | 0.26 MB，2.066 | 0.47 MB，2.357 |
+
+搭配 `fit --keep` 還能再縮小，但色差會增加得更快。
 
 ## 開發
 

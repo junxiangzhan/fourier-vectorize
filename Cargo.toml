@@ -8,6 +8,7 @@ repository = "https://github.com/junxiangzhan/fourier-vectorize"
 
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+lzma-rust2 = { version = "0.25.0", default-features = false, features = ["std", "encoder"] }
 
 [lints.rust]
 unsafe_code = "forbid"

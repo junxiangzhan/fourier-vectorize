@@ -3,6 +3,7 @@
 use crate::{
     color::{hex, lab_to_rgb, svg_lab_filter},
     fit::{harmonics, samples},
+    packed::{unpack, MAGIC},
     Color, Complex, Error, Image, Rasterizer,
 };
 use std::{
@@ -218,6 +219,15 @@ impl Drawing {
 
     /// Reads a coefficients CSV and the size and base levels from its JSON
     /// summary (the same stem, ending .json instead of _coefficients.csv).
+    pub(crate) fn load(path: &Path) -> Result<Self, Error> {
+        let bytes = std::fs::read(path)?;
+        if bytes.starts_with(MAGIC) {
+            unpack(&bytes)
+        } else {
+            Self::read(path)
+        }
+    }
+
     pub(crate) fn read(path: &Path) -> Result<Self, Error> {
         let bad = || Error::InvalidParameter("not a coefficients file written by `fit`");
         let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(bad)?;

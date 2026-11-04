@@ -6,6 +6,7 @@ use crate::{
     drawing::{Drawing, SvgDetail, PLATES},
     fit::fit_all,
     outline::smooth_outlines,
+    packed,
     preprocess::{bilateral, shrink, shrink_factor},
     prune::{prune_fits, Prune},
     Color, Complex, Error, FitKind, Image,
@@ -157,15 +158,27 @@ pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<Pat
     Ok(summary)
 }
 
-/// Draws a coefficients CSV written by `fit_image`, `scale` times larger, as
-/// the browser SVG (when `svg` gives its detail) and/or a BMP, named after
+/// Packs a coefficients CSV written by `fit_image` into <stem>_m<movement>.fvc,
+/// quantizing so that each curve moves by an RMS of `movement` pixels, which
+/// loses accuracy. Returns the file written.
+pub fn pack(output: &Path, path: &Path, movement: f64) -> Result<PathBuf, Error> {
+    let drawing = Drawing::read(path)?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let stem = name.trim_end_matches("_coefficients.csv");
+    let file = output.join(format!("{stem}_m{movement}.fvc"));
+    std::fs::write(&file, packed::pack(&drawing, movement)?)?;
+    Ok(file)
+}
+
+/// Draws a coefficients CSV written by `fit_image` or a file written by `pack`,
+/// `scale` times larger, as the browser SVG (when `svg` gives its detail) and/or a BMP, named after
 /// the CSV's stem (with _x<scale> when enlarged; an SVG also has _t<tolerance>
 /// and _d<decimals> when they differ from the defaults). The BMP is filled
 /// from the series itself. Returns the files written.
 pub fn render(output: &Path, path: &Path, scale: usize, svg: Option<SvgDetail>, bitmap: bool) -> Result<Vec<PathBuf>, Error> {
-    let drawing = Drawing::read(path)?;
+    let drawing = Drawing::load(path)?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-    let stem = name.trim_end_matches("_coefficients.csv");
+    let stem = name.trim_end_matches("_coefficients.csv").trim_end_matches(".fvc");
     let stem = if scale == 1 { stem.to_owned() } else { format!("{stem}_x{scale}") };
     let mut written = Vec::new();
     if let Some(detail) = svg {
@@ -288,6 +301,36 @@ mod tests {
             let again = mean_delta_e(&measure(&redrawn, &reference).unwrap());
             assert!((again - mean_delta_e(&text)).abs() < 1e-3, "{again} vs {text}");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn packed_files_stand_alone_and_draw_about_the_same() {
+        let dir = scratch_dir("packed");
+        let (picture, path) = blocks(&dir);
+        let reference = eight_bit(&picture).unwrap();
+        fit_image(&dir, &path, &dft_options(None)).unwrap();
+        let csv = dir.join("blocks_dft_coefficients.csv");
+        let fine = pack(&dir, &csv, 0.01).unwrap();
+        assert!(fine.ends_with("blocks_dft_m0.01.fvc"), "{fine:?}");
+        assert!(std::fs::metadata(&fine).unwrap().len() < std::fs::metadata(&csv).unwrap().len() / 4);
+        let delta = |file: &Path| {
+            let written = render(&dir, file, 1, None, true).unwrap();
+            let image = bmp::read(&std::fs::read(&written[0]).unwrap()).unwrap();
+            mean_delta_e(&measure(&image, &reference).unwrap())
+        };
+        let exact = delta(&csv);
+        // It needs nothing else: not the summary, not the CSV.
+        std::fs::remove_file(dir.join("blocks_dft.json")).unwrap();
+        std::fs::remove_file(&csv).unwrap();
+        // This small picture's long straight edges lie close to where the fill
+        // samples, so a tiny movement can flip many of them at once.
+        let packed = delta(&fine);
+        assert!((packed - exact).abs() < 0.1, "{packed} vs {exact}");
+        let svg = render(&dir, &fine, 1, Some(SvgDetail::default()), false).unwrap();
+        assert!(svg[0].ends_with("blocks_dft_m0.01.svg"), "{svg:?}");
+        // Packing takes a CSV, not its own output.
+        assert!(pack(&dir, &fine, 0.2).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -141,9 +141,42 @@ fn unsupported_or_corrupt_files_are_refused() {
 }
 
 #[test]
+fn pack_then_render_needs_only_the_packed_file() {
+    let dir = fresh_dir("cli-test-pack");
+    let png = dir.join("square.png");
+    square().save(&png).unwrap();
+    fit_cheaply(&png, &dir);
+    let (csv, out) = (dir.join("square_dft_coefficients.csv"), dir.to_str().unwrap());
+    let (ok, error) = run(&["pack", csv.to_str().unwrap(), "--out", out, "--movement", "0.1"]);
+    assert!(ok, "{error}");
+    let packed = dir.join("square_dft_m0.1.fvc");
+    assert!(packed.exists());
+    std::fs::remove_file(&csv).unwrap();
+    std::fs::remove_file(dir.join("square_dft.json")).unwrap();
+    let (ok, error) = run(&["render", packed.to_str().unwrap(), "--out", out]);
+    assert!(ok, "{error}");
+    assert!(dir.join("square_dft_m0.1.svg").exists());
+    assert!(dir.join("square_dft_m0.1.bmp").exists());
+    // A damaged one is refused.
+    let bytes = std::fs::read(&packed).unwrap();
+    let cut = dir.join("cut.fvc");
+    std::fs::write(&cut, &bytes[..bytes.len() / 2]).unwrap();
+    let (ok, error) = run(&["render", cut.to_str().unwrap(), "--out", out]);
+    assert!(!ok && error.starts_with("Error:"), "{error}");
+}
+
+#[test]
 fn bad_arguments_are_refused() {
     for args in [
         &["frobnicate"][..],
+        &["pack"],
+        &["pack", "a_coefficients.csv", "--movement", "0"],
+        &["pack", "a_coefficients.csv", "--movement", "-1"],
+        &["pack", "a_coefficients.csv", "--movement", "inf"],
+        &["pack", "a_coefficients.csv", "--scale", "2"],
+        &["pack", "does-not-exist_coefficients.csv"],
+        &["render", "a_coefficients.csv", "--movement", "0.2"],
+        &["fit", "a.bmp", "--movement", "0.2"],
         &["fit"],
         &["fit", "a.bmp", "--keep", "1.5"],
         &["fit", "a.bmp", "--keep", "0"],
