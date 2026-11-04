@@ -1,20 +1,24 @@
 //! Command-line entry point.
-use fourier_vectorize::{fit_image, pack, render, Error, FitKind, FitOptions, Prune, PruneBy, SvgDetail};
+use fourier_vectorize::{fit_image, pack, render, Error, FitKind, FitOptions, Prune, PruneBy, SvgDetail, DEFAULT_MOVEMENT};
 use std::{path::PathBuf, str::FromStr};
 
 const HELP: &str = "\
 fourier-vectorize fit IMAGE... [--out DIR] [--factor N] [--levels 32,16,16] [--method dft|refined|descent]
-                      [--keep SHARE [--prune largest|lowpass] [--rounds N] [--prune-steps N]]
-    Fit a PNG, JPEG or uncompressed 24-bit BMP with Fourier series, whatever the file's extension.
-    Writes <name>_<method>_coefficients.csv and a JSON summary with mean dE and SSIM (default method:
-    refined). --factor N shrinks by box-averaging N x N blocks; without it, the smallest factor that
-    brings the longer side to at most 2000 px is used.
+                      [--movement PX | --csv] [--keep SHARE [--prune largest|lowpass] [--rounds N] [--prune-steps N]]
+    Fit a PNG, JPEG or uncompressed 24-bit BMP with Fourier series, whatever the file's extension. EXIF
+    orientation is applied, and transparent pixels are drawn over white.
+    Writes <name>_<method>_m<PX>.fvc, a small binary file for `render`, and a JSON summary with mean dE
+    and SSIM (default method: refined). --movement is how far rounding the coefficients may move each
+    curve, as an RMS in pixels (default 0.2), which costs accuracy; --csv writes
+    <name>_<method>_coefficients.csv instead, which is far larger and can be packed later.
+    --factor N shrinks by box-averaging N x N blocks; without it, the smallest factor that brings the
+    longer side to at most 2000 px is used.
     --keep drops coefficients until SHARE of them (0..1, exclusive) remain, then descends again, which
     costs accuracy. --prune picks them by size (largest, default) or lowest harmonics (lowpass);
     --rounds cuts in N equal ratios (default 1, all at once); --prune-steps is the total descent
     (default 400): half over the rounds, half on the final set. The file name records all of these.
 fourier-vectorize pack COEFFICIENTS.csv... [--out DIR] [--movement PX]
-    Pack coefficients written by `fit` into <name>_m<PX>.fvc, a small binary file that needs nothing
+    Pack a CSV written by `fit --csv` into <name>_m<PX>.fvc, a small binary file that needs nothing
     else to be drawn. --movement is how far rounding the coefficients may move each curve, as an RMS
     in pixels (default 0.2), which costs accuracy.
 fourier-vectorize render FILE... [--out DIR] [--scale N] [--svg] [--bmp] [--lines] [--tolerance PX] [--decimals N]
@@ -64,7 +68,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, Error
     let (mut scale, mut svg, mut bmp) = (1, false, false);
     let mut detail = SvgDetail::default();
     let mut detail_option = false;
-    let mut movement = 0.2;
+    let mut movement = None;
+    let mut csv = false;
     let is_render = !is_fit && !is_pack;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -150,13 +155,15 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, Error
                 }
                 detail_option = true;
             }
-            "--movement" if is_pack => {
+            "--movement" if is_fit || is_pack => {
                 let message = "--movement needs a distance above 0 pixels";
-                movement = value(&mut args, message)?;
-                if !(movement > 0.0 && f64::is_finite(movement)) {
+                let distance: f64 = value(&mut args, message)?;
+                if !(distance > 0.0 && distance.is_finite()) {
                     return Err(Error::InvalidParameter(message));
                 }
+                movement = Some(distance);
             }
+            "--csv" if is_fit => csv = true,
             _ if arg.starts_with('-') => return Err(Error::InvalidParameter("unknown argument for this command; use --help")),
             _ => files.push(PathBuf::from(arg)),
         }
@@ -168,10 +175,14 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, Error
         if prune_option && prune.keep >= 1.0 {
             return Err(Error::InvalidParameter("--prune, --rounds and --prune-steps need --keep"));
         }
+        if csv && movement.is_some() {
+            return Err(Error::InvalidParameter("--movement sets the rounding of a packed file; --csv writes a CSV instead"));
+        }
         options.prune = (prune.keep < 1.0).then_some(prune);
+        options.movement = (!csv).then_some(movement.unwrap_or(DEFAULT_MOVEMENT));
         Job::Fit(options)
     } else if is_pack {
-        Job::Pack { movement }
+        Job::Pack { movement: movement.unwrap_or(DEFAULT_MOVEMENT) }
     } else {
         if detail_option && bmp && !svg {
             return Err(Error::InvalidParameter("--lines, --tolerance and --decimals only change the SVG; a BMP is filled from the series"));
@@ -192,7 +203,9 @@ fn run() -> Result<(), Error> {
     for file in &config.files {
         match &config.job {
             Job::Fit(options) => {
-                println!("Fitted: {}", fit_image(&config.output, file, options)?.display());
+                let fitted = fit_image(&config.output, file, options)?;
+                println!("Fitted: {}", fitted.coefficients.display());
+                println!("Summary: {}", fitted.summary.display());
             }
             Job::Pack { movement } => {
                 println!("Packed: {}", pack(&config.output, file, *movement)?.display());

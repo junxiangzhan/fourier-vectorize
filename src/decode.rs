@@ -1,13 +1,15 @@
 //! Reads a picture file of any supported format into floating RGB.
 use crate::{bmp, Color, Error, Image};
-use ::image::ImageFormat;
+use ::image::{ImageDecoder, ImageFormat, ImageReader};
+use std::io::Cursor;
 
 /// Decodes a BMP, PNG or JPEG, told apart by their contents rather than the
-/// file name. PNG and JPEG are taken as stored: alpha, embedded colour
-/// profiles and EXIF orientation are all ignored.
-pub(crate) fn decode(bytes: &[u8]) -> Result<Image<Color>, Error> {
+/// file name, and says whether it had any transparency. EXIF orientation is
+/// applied and transparent pixels are laid over white, whatever colour they
+/// store; embedded colour profiles are ignored.
+pub(crate) fn decode(bytes: &[u8]) -> Result<(Image<Color>, bool), Error> {
     if bytes.starts_with(b"BM") {
-        return bmp::read(bytes);
+        return Ok((bmp::read(bytes)?, false));
     }
     match ::image::guess_format(bytes) {
         Ok(ImageFormat::Png) => {}
@@ -15,18 +17,26 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Image<Color>, Error> {
         Ok(ImageFormat::Jpeg) => return Err(Error::InvalidParameter("truncated JPEG: it has no end-of-image marker")),
         _ => return Err(Error::InvalidParameter("unsupported image format; fit reads BMP, PNG and JPEG")),
     }
-    let decoded = ::image::load_from_memory(bytes).map_err(|e| Error::Decode(e.to_string()))?;
+    let failed = |e: ::image::ImageError| Error::Decode(e.to_string());
+    let reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+    let orientation = reader.into_decoder().and_then(|mut d| d.orientation()).map_err(failed)?;
+    let mut decoded = ::image::load_from_memory(bytes).map_err(failed)?;
+    decoded.apply_orientation(orientation);
     // 16 bits per channel keeps a 16-bit PNG's precision. An 8-bit value v
     // widens to v * 257, and v * 257 / 65535 is the same f64 as the BMP
     // reader's v / 255.
-    let decoded = decoded.into_rgb16();
+    let decoded = decoded.into_rgba16();
     let mut image = Image::new(decoded.width() as usize, decoded.height() as usize, Color::rgb(0.0, 0.0, 0.0))?;
+    let mut transparent = false;
     let channel = |v: u16| v as f64 / 65535.0;
     for (x, y, pixel) in decoded.enumerate_pixels() {
-        let [r, g, b] = pixel.0;
-        *image.get_mut(x as usize, y as usize).unwrap() = Color::rgb(channel(r), channel(g), channel(b));
+        let [r, g, b, a] = pixel.0;
+        transparent |= a < u16::MAX;
+        // At full opacity this is exactly the stored value.
+        let over_white = |v: u16| channel(v) * channel(a) + (1.0 - channel(a));
+        *image.get_mut(x as usize, y as usize).unwrap() = Color::rgb(over_white(r), over_white(g), over_white(b));
     }
-    Ok(image)
+    Ok((image, transparent))
 }
 
 /// Whether a JPEG reaches its end-of-image marker. The decoder is lenient and
@@ -78,6 +88,7 @@ mod tests {
     fn png_pixels_equal_bmp_pixels_exactly() {
         let pixels = all_values();
         let expected = decode(&bmp_of(&pixels)).unwrap();
+        assert!(!expected.1);
         assert_eq!(decode(&png(&pixels, ExtendedColorType::Rgb8)).unwrap(), expected);
         // Opaque alpha and the same values widened to 16 bits change nothing.
         let rgba: Vec<u8> = pixels.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
@@ -95,7 +106,7 @@ mod tests {
         for (i, sample) in [r, g, b].iter().enumerate() {
             wide[i * 2..i * 2 + 2].copy_from_slice(&sample.to_ne_bytes());
         }
-        let image = decode(&png(&wide, ExtendedColorType::Rgb16)).unwrap();
+        let (image, _) = decode(&png(&wide, ExtendedColorType::Rgb16)).unwrap();
         let expected = Color::rgb(r as f64 / 65535.0, g as f64 / 65535.0, b as f64 / 65535.0);
         assert_eq!(*image.get(0, 0).unwrap(), expected);
     }
@@ -108,7 +119,7 @@ mod tests {
 
     #[test]
     fn jpeg_decodes_to_the_same_size() {
-        let image = decode(&jpeg()).unwrap();
+        let (image, _) = decode(&jpeg()).unwrap();
         assert_eq!((image.width(), image.height()), (256, 3));
     }
 
@@ -129,6 +140,99 @@ mod tests {
         bytes.extend_from_slice(&whole[2..]);
         assert!(decode(&bytes).is_ok());
         assert!(decode(&bytes[..bytes.len() - 2]).is_err());
+    }
+
+    /// A TIFF block holding only an EXIF orientation.
+    fn exif(orientation: u8) -> Vec<u8> {
+        let mut block = b"MM\0*\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0".to_vec();
+        block.extend_from_slice(&[orientation, 0, 0, 0, 0, 0, 0]);
+        block
+    }
+
+    /// Black at the top left, white everywhere else.
+    fn corner(x: u32, y: u32) -> [u8; 3] {
+        if (x, y) == (0, 0) {
+            [0; 3]
+        } else {
+            [255; 3]
+        }
+    }
+
+    /// Where the black corner ended up, and the size of the picture.
+    fn black_at(image: &Image<Color>) -> (usize, usize, usize, usize) {
+        let at = image.pixels().iter().position(|c| c.r < 0.5).unwrap();
+        (at % image.width(), at / image.width(), image.width(), image.height())
+    }
+
+    #[test]
+    fn exif_orientation_turns_a_png() {
+        let pixels: Vec<u8> = (0..3).flat_map(|y| (0..2).flat_map(move |x| corner(x, y))).collect();
+        // EXIF value: where the black top left corner of a 2 x 3 picture goes.
+        for (value, expected) in [
+            (1, (0, 0, 2, 3)),
+            (2, (1, 0, 2, 3)),
+            (3, (1, 2, 2, 3)),
+            (4, (0, 2, 2, 3)),
+            (5, (0, 0, 3, 2)),
+            (6, (2, 0, 3, 2)),
+            (7, (2, 1, 3, 2)),
+            (8, (0, 1, 3, 2)),
+        ] {
+            let mut bytes = Vec::new();
+            let mut encoder = ::image::codecs::png::PngEncoder::new(&mut bytes);
+            encoder.set_exif_metadata(exif(value)).unwrap();
+            encoder.write_image(&pixels, 2, 3, ExtendedColorType::Rgb8).unwrap();
+            assert_eq!(black_at(&decode(&bytes).unwrap().0), expected, "orientation {value}");
+        }
+    }
+
+    #[test]
+    fn exif_orientation_turns_a_jpeg() {
+        // Large enough blocks that the corner survives compression.
+        let (w, h) = (32u32, 48u32);
+        let pixels: Vec<u8> = (0..h).flat_map(|y| (0..w).flat_map(move |x| corner(x / 16, y / 16))).collect();
+        let mut plain = Vec::new();
+        ::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut plain, 95).write_image(&pixels, w, h, ExtendedColorType::Rgb8).unwrap();
+        let (upright, _) = decode(&plain).unwrap();
+        assert_eq!((upright.width(), upright.height()), (32, 48));
+        assert!(upright.get(4, 4).unwrap().r < 0.5);
+        // The way a camera stores it: an APP1 segment right after the start.
+        let block = [b"Exif\0\0".to_vec(), exif(6)].concat();
+        let mut bytes = plain[..2].to_vec();
+        bytes.extend_from_slice(&[0xFF, 0xE1]);
+        bytes.extend_from_slice(&(block.len() as u16 + 2).to_be_bytes());
+        bytes.extend_from_slice(&block);
+        bytes.extend_from_slice(&plain[2..]);
+        let (turned, _) = decode(&bytes).unwrap();
+        assert_eq!((turned.width(), turned.height()), (48, 32));
+        assert!(turned.get(43, 4).unwrap().r < 0.5);
+        assert!(turned.get(4, 4).unwrap().r > 0.5);
+    }
+
+    #[test]
+    fn transparent_pixels_are_laid_over_white_whatever_they_store() {
+        // Clear black, half-clear black, half-clear red, opaque blue.
+        let pixels = [0, 0, 0, 0, 0, 0, 0, 128, 255, 0, 0, 128, 0, 0, 255, 255];
+        let mut bytes = Vec::new();
+        ::image::codecs::png::PngEncoder::new(&mut bytes).write_image(&pixels, 2, 2, ExtendedColorType::Rgba8).unwrap();
+        let (image, transparent) = decode(&bytes).unwrap();
+        assert!(transparent);
+        let half = 1.0 - 128.0 / 255.0;
+        let rgb = |x, y| {
+            let c = image.get(x, y).unwrap();
+            [c.r, c.g, c.b]
+        };
+        assert_eq!(rgb(0, 0), [1.0; 3]);
+        for (got, want) in rgb(1, 0).into_iter().zip([half; 3]).chain(rgb(0, 1).into_iter().zip([1.0, half, half])) {
+            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+        }
+        assert_eq!(rgb(1, 1), [0.0, 0.0, 1.0]);
+        // Grey with alpha takes the same path.
+        let mut bytes = Vec::new();
+        ::image::codecs::png::PngEncoder::new(&mut bytes).write_image(&[0, 0], 1, 1, ExtendedColorType::La8).unwrap();
+        let (image, transparent) = decode(&bytes).unwrap();
+        assert!(transparent);
+        assert_eq!(*image.get(0, 0).unwrap(), Color::rgb(1.0, 1.0, 1.0));
     }
 
     #[test]

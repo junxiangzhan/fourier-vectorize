@@ -16,12 +16,12 @@ cargo build --release
 
 ```bash
 fourier-vectorize fit photo.jpg --out output
-fourier-vectorize render output/photo_refined_coefficients.csv --svg --out output
+fourier-vectorize render output/photo_refined_m0.2.fvc --svg --out output
 ```
 
-`fit` 輸出 `<圖名>_<方法>_coefficients.csv`（每條輪廓的每個 c_k）與 `<圖名>_<方法>.json`（尺寸、各階數值、ΔE、SSIM）。`render` 讀回係數，畫成 SVG 和／或 BMP。
+`fit` 輸出 `<圖名>_<方法>_m0.2.fvc`（壓縮過的係數，`render` 只需要它）與 `<圖名>_<方法>.json`（尺寸、各階數值、壓縮後畫出來的 ΔE、SSIM）。`render` 讀回係數，畫成 SVG 和／或 BMP。
 
-`fit` 讀 PNG、JPEG 和未壓縮的 24-bit BMP，依檔案內容判斷格式，與副檔名無關。像素照檔案所存的值讀入，不做色彩管理：透明度、內嵌的色彩描述檔和 EXIF 方向都會被忽略，所以透明處會畫成它底下存的顏色，手機照片可能是橫的。解碼後超過 512 MB 的 PNG 或 JPEG 會被拒絕。
+`fit` 讀 PNG、JPEG 和未壓縮的 24-bit BMP，依檔案內容判斷格式，與副檔名無關。會依 EXIF 方向轉正。輸出還不支援透明：半透明或透明的部分會疊在白底上再擬合，並印一行提示。內嵌的色彩描述檔會被忽略，不做色彩管理。解碼後超過 512 MB 的 PNG 或 JPEG 會被拒絕。
 
 輸出檔名只取圖名、不含副檔名，所以輸出到同一個資料夾時，`photo.png` 和 `photo.jpg` 會互相覆蓋。
 
@@ -30,6 +30,7 @@ fourier-vectorize render output/photo_refined_coefficients.csv --svg --out outpu
 | `--factor N` | 以 N×N 區塊平均縮小 | 長邊縮到不超過 2000 px 的最小倍數 |
 | `--levels L,a,b` | 三個通道的階數（2..64） | `32,16,16` |
 | `--method dft\|refined\|descent` | DFT、DFT 加梯度下降、只從圓開始梯度下降 | `refined` |
+| `--csv` | 輸出 `<圖名>_<方法>_coefficients.csv`（每條輪廓的每個 c_k），不輸出 `.fvc`；檔案大很多，之後可用 `pack` 以不同 `--movement` 壓縮 | 輸出 `.fvc` |
 
 | `render` 選項 | 作用 | 預設 |
 |---|---|---|
@@ -49,9 +50,9 @@ fourier-vectorize render output/photo_refined_coefficients.csv --svg --out outpu
 | `render --lines` | SVG 輪廓只用直線，不用曲線；放大時會看到折角 | 曲線 | 是 |
 | `render --tolerance PX` | 簡化 SVG 輪廓時可移動的距離（輸出像素）；0 只刪完全共線的點 | 0.1 | 是 |
 | `render --decimals N` | SVG 座標小數位數（0..4） | 1 | 是 |
-| `pack --movement PX` | 把係數檔壓成二進位，量化讓每條輪廓移動約這個 RMS 距離（像素） | 0.2 | 是 |
+| `fit --movement PX`、`pack --movement PX` | 量化係數，讓每條輪廓移動約這個 RMS 距離（像素） | 0.2 | 是 |
 
-SVG 一律使用相對座標，這一步本身不損失資訊。設定會記錄在檔名裡（如 `photo_refined_keep0.17_largest_r8_s400_coefficients.csv`、`photo_refined_lines_t0.5_d0.svg`），不同設定不會互相覆蓋。BMP 直接由級數填色，不受 `--lines`、`--tolerance` 與 `--decimals` 影響。
+SVG 一律使用相對座標，這一步本身不損失資訊。設定會記錄在檔名裡（如 `photo_refined_keep0.17_largest_r8_s400_m0.2.fvc`、`photo_refined_m0.2_lines_t0.5_d0.svg`），不同設定不會互相覆蓋。BMP 直接由級數填色，不受 `--lines`、`--tolerance` 與 `--decimals` 影響。
 
 在兩幅畫上的實驗（各 4 個比例）：保留約 11% 以上時，多輪略優（如 8 輪、400 步保留約 17%）；約 7% 以下則一次刪的色差較小。選法則因畫而異。樣本很少，只能當起點參考。
 
@@ -70,14 +71,16 @@ SVG 預設用一條三次貝茲曲線代替一段連續的點，直線比較省�
 
 ## 壓縮係數
 
-`pack` 把 `fit` 的 CSV 壓成 `.fvc`：把係數量化成整數，再用 LZMA2 壓縮。這個檔案本身就含畫布尺寸和基底階數，`render` 只需要它就能畫，不用 CSV 和 JSON。
+`.fvc` 把係數量化成整數，再用 LZMA2 壓縮。這個檔案本身就含畫布尺寸和基底階數，`render` 只需要它就能畫，不用 JSON。瀏覽器不能直接開 `.fvc`，要顯示時用 `render` 輸出 SVG。
+
+`fit` 預設就輸出它。想比較不同的 `--movement`，不必重新擬合：先用 `fit --csv` 留下 CSV，再用 `pack` 壓縮。
 
 ```bash
-fourier-vectorize pack output/photo_refined_coefficients.csv --out output --movement 0.2
-fourier-vectorize render output/photo_refined_m0.2.fvc --svg --out output
+fourier-vectorize fit photo.jpg --csv --out output
+fourier-vectorize pack output/photo_refined_coefficients.csv --out output --movement 0.4
 ```
 
-瀏覽器不能直接開 `.fvc`，要顯示時用 `render` 輸出 SVG。
+CSV 也能直接給 `render`，但要和同名的 JSON 放在一起。
 
 在兩幅畫上量到的大小與平均 ΔE（未刪減係數，預設階數）：
 

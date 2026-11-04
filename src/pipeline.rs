@@ -19,6 +19,10 @@ const LONGEST: usize = 2000;
 /// A pixel differs visibly when ΔE exceeds this.
 const VISIBLE_DELTA_E: f64 = 10.0;
 
+/// How far `fit` and `pack` let rounding move each curve unless told otherwise,
+/// as an RMS in pixels.
+pub const DEFAULT_MOVEMENT: f64 = 0.2;
+
 /// How to fit a picture.
 #[derive(Clone, Copy)]
 pub struct FitOptions {
@@ -29,10 +33,13 @@ pub struct FitOptions {
     pub levels: [usize; 3],
     pub kind: FitKind,
     pub prune: Option<Prune>,
+    /// Write a packed file that lets rounding move each curve this far, as an
+    /// RMS in pixels; `None` writes a CSV instead, which rounds far less.
+    pub movement: Option<f64>,
 }
 impl Default for FitOptions {
     fn default() -> Self {
-        Self { factor: None, levels: [32, 16, 16], kind: FitKind::Refined, prune: None }
+        Self { factor: None, levels: [32, 16, 16], kind: FitKind::Refined, prune: None, movement: Some(DEFAULT_MOVEMENT) }
     }
 }
 
@@ -58,18 +65,29 @@ fn json_list(values: &[f64], digits: usize) -> String {
     format!("[{}]", values.iter().map(|v| format!("{v:.digits$}")).collect::<Vec<_>>().join(","))
 }
 
-/// Fits one BMP, PNG or JPEG and writes <name>_<fit>_coefficients.csv (every c_k of every
-/// outline) and <name>_<fit>.json (size, levels, counts, and mean ΔE and
-/// lightness SSIM of the rendering against the input). `render` draws the CSV
-/// as SVG or BMP at any scale. A pruned fit has the pruning settings in its
-/// name too, so it never replaces another. Returns the summary's path.
-pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<PathBuf, Error> {
+/// The files one fit wrote.
+pub struct Fitted {
+    /// What `render` draws.
+    pub coefficients: PathBuf,
+    pub summary: PathBuf,
+}
+
+/// Fits one BMP, PNG or JPEG and writes its coefficients, as <name>_<fit>_m<movement>.fvc
+/// or, without a movement, <name>_<fit>_coefficients.csv (every c_k of every outline), and
+/// <name>_<fit>.json (size, levels, counts, and mean ΔE and lightness SSIM of the
+/// rendering against the input). `render` draws the coefficients as SVG or BMP at any
+/// scale. A pruned fit has the pruning settings in its name too, so it never
+/// replaces another.
+pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<Fitted, Error> {
     let started = std::time::Instant::now();
     let name = path
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or(Error::InvalidParameter("image path has no usable file name"))?;
-    let source = decode(&std::fs::read(path)?)?;
+    let (source, transparent) = decode(&std::fs::read(path)?)?;
+    if transparent {
+        eprintln!("{name}: transparent pixels are drawn over white");
+    }
     let factor = shrink_factor(source.width(), source.height(), LONGEST, options.factor);
     let input = shrink(&source, factor)?;
     let (w, h) = (input.width(), input.height());
@@ -138,15 +156,26 @@ pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<Pat
             p.steps
         )
     });
-    let file_name = format!("{stem}_coefficients.csv");
-    drawing.write_coefficients(&output.join(&file_name), options.prune.is_some())?;
-    // Measured on the rendering that `render` gives at scale 1.
-    let measures = measure(&drawing.bitmap(1)?, &eight_bit(&input)?)?;
+    // Measured on the rendering that `render` gives at scale 1, so a packed
+    // file is measured after its rounding.
+    let (file_name, measures, movement_json) = match options.movement {
+        Some(movement) => {
+            let bytes = packed::pack(&drawing, movement)?;
+            let file_name = format!("{stem}_m{movement}.fvc");
+            std::fs::write(output.join(&file_name), &bytes)?;
+            (file_name, measure(&packed::unpack(&bytes)?.bitmap(1)?, &eight_bit(&input)?)?, format!("\"movement\":{movement},"))
+        }
+        None => {
+            let file_name = format!("{stem}_coefficients.csv");
+            drawing.write_coefficients(&output.join(&file_name), options.prune.is_some())?;
+            (file_name, measure(&drawing.bitmap(1)?, &eight_bit(&input)?)?, String::new())
+        }
+    };
     let summary = output.join(format!("{stem}.json"));
     std::fs::write(
         &summary,
         format!(
-            "{{\"image\":\"{name}\",\"source\":[{},{}],\"factor\":{factor},\"size\":[{w},{h}],\"fit\":\"{fit_name}\",{prune_json}\"levels\":{{{}}},\"outlines\":{},\"outline_points\":{points},\"coefficients\":{coefficients},\"dropped_small\":{dropped},\"edge_rms\":{:.6},\"measures\":{measures},\"coefficients_file\":\"{file_name}\",\"seconds\":{:.3}}}\n",
+            "{{\"image\":\"{name}\",\"source\":[{},{}],\"factor\":{factor},\"size\":[{w},{h}],\"fit\":\"{fit_name}\",{prune_json}\"levels\":{{{}}},\"outlines\":{},\"outline_points\":{points},\"coefficients\":{coefficients},\"dropped_small\":{dropped},\"edge_rms\":{:.6},\"measures\":{measures},{movement_json}\"coefficients_file\":\"{file_name}\",\"seconds\":{:.3}}}\n",
             source.width(),
             source.height(),
             levels_json.join(","),
@@ -155,7 +184,7 @@ pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<Pat
             started.elapsed().as_secs_f64()
         ),
     )?;
-    Ok(summary)
+    Ok(Fitted { coefficients: output.join(file_name), summary })
 }
 
 /// Packs a coefficients CSV written by `fit_image` into <stem>_m<movement>.fvc,
@@ -170,9 +199,8 @@ pub fn pack(output: &Path, path: &Path, movement: f64) -> Result<PathBuf, Error>
     Ok(file)
 }
 
-/// Draws a coefficients CSV written by `fit_image` or a file written by `pack`,
-/// `scale` times larger, as the browser SVG (when `svg` gives its detail) and/or a BMP, named after
-/// the CSV's stem (with _x<scale> when enlarged; an SVG also has _lines, _t<tolerance>
+/// Draws a file written by `fit_image` or `pack`, `scale` times larger, as the browser SVG (when `svg` gives its detail) and/or a BMP, named after
+/// the file's stem (with _x<scale> when enlarged; an SVG also has _lines, _t<tolerance>
 /// and _d<decimals> when they differ from the defaults). The BMP is filled
 /// from the series itself. Returns the files written.
 pub fn render(output: &Path, path: &Path, scale: usize, svg: Option<SvgDetail>, bitmap: bool) -> Result<Vec<PathBuf>, Error> {
@@ -242,7 +270,7 @@ mod tests {
     }
 
     fn dft_options(prune: Option<Prune>) -> FitOptions {
-        FitOptions { factor: Some(1), levels: [4, 3, 3], kind: FitKind::Dft, prune }
+        FitOptions { factor: Some(1), levels: [4, 3, 3], kind: FitKind::Dft, prune, movement: None }
     }
 
     #[test]
@@ -250,7 +278,7 @@ mod tests {
         let dir = scratch_dir("render");
         let (picture, path) = blocks(&dir);
         let (w, h) = (picture.width(), picture.height());
-        let summary = fit_image(&dir, &path, &dft_options(None)).unwrap();
+        let summary = fit_image(&dir, &path, &dft_options(None)).unwrap().summary;
         let recorded = mean_delta_e(&std::fs::read_to_string(&summary).unwrap());
         let csv = dir.join("blocks_dft_coefficients.csv");
         let written = render(&dir, &csv, 1, Some(SvgDetail::default()), true).unwrap();
@@ -279,7 +307,7 @@ mod tests {
         let dense = rows(&dir.join("blocks_dft_coefficients.csv"));
         for (by, tag) in [(PruneBy::Largest, "largest"), (PruneBy::LowPass, "lowpass")] {
             let prune = Prune { keep: 0.5, by, rounds: 2, steps: 20 };
-            let summary = fit_image(&dir, &path, &dft_options(Some(prune))).unwrap();
+            let summary = fit_image(&dir, &path, &dft_options(Some(prune))).unwrap().summary;
             let stem = format!("blocks_dft_keep0.5_{tag}_r2_s20");
             assert!(summary.ends_with(format!("{stem}.json")), "{summary:?}");
             let csv = dir.join(format!("{stem}_coefficients.csv"));
@@ -334,6 +362,29 @@ mod tests {
         assert!(svg[0].ends_with("blocks_dft_m0.01.svg"), "{svg:?}");
         // Packing takes a CSV, not its own output.
         assert!(pack(&dir, &fine, 0.2).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_fit_packs_by_default_and_records_how_the_packed_file_draws() {
+        let dir = scratch_dir("fit-packed");
+        let (picture, path) = blocks(&dir);
+        let options = FitOptions { movement: Some(DEFAULT_MOVEMENT), ..dft_options(None) };
+        let fitted = fit_image(&dir, &path, &options).unwrap();
+        assert!(fitted.coefficients.ends_with("blocks_dft_m0.2.fvc"), "{:?}", fitted.coefficients);
+        assert!(!dir.join("blocks_dft_coefficients.csv").exists());
+        let text = std::fs::read_to_string(&fitted.summary).unwrap();
+        assert!(text.contains(r#""movement":0.2,"coefficients_file":"blocks_dft_m0.2.fvc""#), "{text}");
+        let written = render(&dir, &fitted.coefficients, 1, None, true).unwrap();
+        let redrawn = bmp::read(&std::fs::read(&written[0]).unwrap()).unwrap();
+        let again = mean_delta_e(&measure(&redrawn, &eight_bit(&picture).unwrap()).unwrap());
+        assert!((again - mean_delta_e(&text)).abs() < 1e-3, "{again} vs {text}");
+        // A pruned fit packs too, and stays sparse.
+        let prune = Prune { keep: 0.5, by: PruneBy::Largest, rounds: 1, steps: 10 };
+        let options = FitOptions { prune: Some(prune), ..options };
+        let fitted = fit_image(&dir, &path, &options).unwrap();
+        assert!(fitted.coefficients.ends_with("blocks_dft_keep0.5_largest_r1_s10_m0.2.fvc"), "{:?}", fitted.coefficients);
+        assert!(!render(&dir, &fitted.coefficients, 1, None, true).unwrap().is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

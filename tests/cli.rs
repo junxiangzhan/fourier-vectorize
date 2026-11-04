@@ -24,7 +24,7 @@ fn fit_then_render_writes_the_named_files() {
     let image = dir.join("square.bmp");
     picture.save_bmp(&image).unwrap();
     let (image, out) = (image.to_str().unwrap(), dir.to_str().unwrap());
-    let (ok, error) = run(&["fit", image, "--out", out, "--factor", "1", "--levels", "4,3,3", "--method", "dft", "--keep", "0.5", "--rounds", "2", "--prune-steps", "10"]);
+    let (ok, error) = run(&["fit", image, "--out", out, "--factor", "1", "--levels", "4,3,3", "--method", "dft", "--csv", "--keep", "0.5", "--rounds", "2", "--prune-steps", "10"]);
     assert!(ok, "{error}");
     let csv = dir.join("square_dft_keep0.5_largest_r2_s10_coefficients.csv");
     assert!(csv.exists());
@@ -63,7 +63,7 @@ fn square() -> image::RgbImage {
 /// coefficients and the summary without its timing.
 fn fit_cheaply(file: &Path, out: &Path) -> (String, String) {
     std::fs::create_dir_all(out).unwrap();
-    let (ok, error) = run(&["fit", file.to_str().unwrap(), "--out", out.to_str().unwrap(), "--factor", "1", "--levels", "8,4,4", "--method", "dft"]);
+    let (ok, error) = run(&["fit", file.to_str().unwrap(), "--out", out.to_str().unwrap(), "--factor", "1", "--levels", "8,4,4", "--method", "dft", "--csv"]);
     assert!(ok, "{file:?}: {error}");
     let coefficients = std::fs::read_to_string(out.join("square_dft_coefficients.csv")).unwrap();
     let summary = std::fs::read_to_string(out.join("square_dft.json")).unwrap();
@@ -169,6 +169,43 @@ fn pack_then_render_needs_only_the_packed_file() {
 }
 
 #[test]
+fn fit_alone_gives_what_render_needs() {
+    let dir = fresh_dir("cli-test-default");
+    let png = dir.join("square.png");
+    square().save(&png).unwrap();
+    let out = dir.to_str().unwrap();
+    let fit = |extra: &[&str]| {
+        let mut args = vec!["fit", png.to_str().unwrap(), "--out", out, "--factor", "1", "--levels", "4,3,3", "--method", "dft"];
+        args.extend_from_slice(extra);
+        Command::new(env!("CARGO_BIN_EXE_fourier-vectorize")).args(args).output().unwrap()
+    };
+    let output = fit(&[]);
+    assert!(output.status.success());
+    let packed = dir.join("square_dft_m0.2.fvc");
+    let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(printed.contains(&format!("Fitted: {}", packed.display())), "{printed}");
+    // It said nothing about transparency, as the picture has none.
+    assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(!dir.join("square_dft_coefficients.csv").exists());
+    let (ok, error) = run(&["render", packed.to_str().unwrap(), "--out", out, "--svg"]);
+    assert!(ok, "{error}");
+    assert!(dir.join("square_dft_m0.2.svg").exists());
+    // Its own rounding goes in the name.
+    assert!(fit(&["--movement", "0.4"]).status.success());
+    assert!(dir.join("square_dft_m0.4.fvc").exists());
+}
+
+#[test]
+fn a_transparent_picture_is_mentioned() {
+    let dir = fresh_dir("cli-test-transparent");
+    let png = dir.join("clear.png");
+    image::RgbaImage::from_fn(40, 32, |x, _| image::Rgba([20, 40, 200, if x < 20 { 255 } else { 0 }])).save(&png).unwrap();
+    let (ok, error) = run(&["fit", png.to_str().unwrap(), "--out", dir.to_str().unwrap(), "--factor", "1", "--levels", "4,3,3", "--method", "dft"]);
+    assert!(ok, "{error}");
+    assert!(error.contains("transparent"), "{error}");
+}
+
+#[test]
 fn bad_arguments_are_refused() {
     for args in [
         &["frobnicate"][..],
@@ -179,7 +216,10 @@ fn bad_arguments_are_refused() {
         &["pack", "a_coefficients.csv", "--scale", "2"],
         &["pack", "does-not-exist_coefficients.csv"],
         &["render", "a_coefficients.csv", "--movement", "0.2"],
-        &["fit", "a.bmp", "--movement", "0.2"],
+        &["fit", "a.bmp", "--movement", "0"],
+        &["fit", "a.bmp", "--movement", "0.2", "--csv"],
+        &["render", "a_coefficients.csv", "--csv"],
+        &["pack", "a_coefficients.csv", "--csv"],
         &["fit"],
         &["fit", "a.bmp", "--keep", "1.5"],
         &["fit", "a.bmp", "--keep", "0"],

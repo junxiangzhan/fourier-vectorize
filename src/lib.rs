@@ -25,6 +25,6 @@ pub use error::Error;
 pub use fit::FitKind;
 pub use fourier::{fft, Complex};
 pub use image::{Color, Image};
-pub use pipeline::{fit_image, pack, render, FitOptions};
+pub use pipeline::{fit_image, pack, render, FitOptions, Fitted, DEFAULT_MOVEMENT};
 pub use prune::{Prune, PruneBy};
 pub use raster::Rasterizer;
