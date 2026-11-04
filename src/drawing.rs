@@ -36,8 +36,10 @@ pub(crate) struct Drawing {
 pub(crate) const PLATES: [&str; 4] = ["lightness", "a", "b", "alpha"];
 /// The plate of `PLATES` that holds alpha.
 pub(crate) const ALPHA: usize = 3;
+/// What a filterless SVG's outlines of L*, a* and b* are called, before the level.
+const STACK_IDS: [&str; 3] = ["L", "a", "b"];
 
-/// How much detail an SVG's outlines keep.
+/// How an SVG is drawn, and how much detail its outlines keep.
 #[derive(Clone, Copy, PartialEq)]
 pub struct SvgDetail {
     /// How far simplifying may move an outline, in output pixels.
@@ -47,10 +49,13 @@ pub struct SvgDetail {
     /// Straight lines only, instead of curves where those are shorter. Corners
     /// show when the SVG is enlarged.
     pub lines: bool,
+    /// One colour per combination of levels, cut out with clip paths, instead
+    /// of the Lab filter. For software without filters; far slower to draw.
+    pub no_filter: bool,
 }
 impl Default for SvgDetail {
     fn default() -> Self {
-        Self { tolerance: 0.1, decimals: 1, lines: false }
+        Self { tolerance: 0.1, decimals: 1, lines: false, no_filter: false }
     }
 }
 
@@ -158,6 +163,18 @@ fn directions(coefficients: &[Complex], m: usize, count: usize) -> Result<Vec<Co
     samples(&turned, m, count)
 }
 
+/// A mask's curves as filled in a bitmap: sampled as in the fits (s from the
+/// outline's points), times `scale`.
+fn contours(curves: &[Curve], scale: usize) -> Result<Vec<Vec<Complex>>, Error> {
+    curves
+        .iter()
+        .map(|(n, m, c)| {
+            let s = (2 * n).max(4 * m + 2).next_power_of_two().max(64) * scale.next_power_of_two();
+            samples(c, *m, s).map(|z| z.iter().map(|q| q.scale(scale as f64)).collect())
+        })
+        .collect()
+}
+
 /// One level's curves as the data of one path.
 fn write_curves(file: &mut impl Write, curves: &[Curve], scale: usize, detail: SvgDetail) -> Result<(), Error> {
     for (_, m, c) in curves {
@@ -179,10 +196,9 @@ fn write_curves(file: &mut impl Write, curves: &[Curve], scale: usize, detail: S
 }
 
 impl Drawing {
-    /// Rendered `scale` times larger: each mask's curves are sampled as in
-    /// the fits (s from the outline's points), times `scale`, and filled
-    /// together with the non-zero rule, each level over the ones below. A
-    /// bitmap has no transparency, so any alpha is drawn over white.
+    /// Rendered `scale` times larger: each mask's curves are filled together
+    /// with the non-zero rule, each level over the ones below. A bitmap has no
+    /// transparency, so any alpha is drawn over white.
     pub(crate) fn bitmap(&self, scale: usize) -> Result<Image<Color>, Error> {
         let (w, h) = (self.w * scale, self.h * scale);
         let raster = Rasterizer::new(w, h)?;
@@ -191,14 +207,7 @@ impl Drawing {
             plates.push(Image::new(w, h, base)?);
         }
         for (channel, _, value, curves) in &self.masks {
-            let contours: Vec<Vec<Complex>> = curves
-                .iter()
-                .map(|(n, m, c)| {
-                    let s = (2 * n).max(4 * m + 2).next_power_of_two().max(64) * scale.next_power_of_two();
-                    samples(c, *m, s).map(|z| z.iter().map(|q| q.scale(scale as f64)).collect())
-                })
-                .collect::<Result<_, _>>()?;
-            let coverage = raster.render(&contours, FILL_K)?;
+            let coverage = raster.render(&contours(curves, scale)?, FILL_K)?;
             let image = &mut plates[*channel];
             for (i, m) in coverage.pixels().iter().enumerate() {
                 let v = image.get_mut(i % w, i / w).unwrap();
@@ -220,20 +229,19 @@ impl Drawing {
     /// channel and the Lab filter turns the three channels back into RGB. A curve with m harmonics is sampled
     /// at 4m points (at least twice its highest frequency), times `scale`,
     /// then simplified as `detail` says; one non-zero path per level. An alpha
-    /// plate is drawn in grey as a mask over the filtered picture.
+    /// plate is drawn in grey as a mask over the filtered picture. With
+    /// `detail.no_filter` the picture is `write_stack`'s instead.
     pub(crate) fn write_svg(&self, path: &Path, scale: usize, detail: SvgDetail) -> Result<(), Error> {
         let (w, h) = (self.w * scale, self.h * scale);
-        let encode = |channel: usize, v: f64| {
-            let mut c = [0.0; 3];
-            c[channel] = if channel == 0 { v / 100.0 } else { (v + 128.0) / 255.0 };
-            hex(Color::rgb(c[0], c[1], c[2]))
-        };
+        let stack = detail.no_filter.then(|| self.triples(scale)).transpose()?;
         let mut file = BufWriter::new(File::create(path)?);
-        write!(
-            file,
-            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {w} {h}\" width=\"{w}\" height=\"{h}\">\n{}",
-            svg_lab_filter(w, h)
-        )?;
+        // Software old enough to lack filters may know `use` only through xlink.
+        let xlink = if stack.is_some() { " xmlns:xlink=\"http://www.w3.org/1999/xlink\"" } else { "" };
+        writeln!(file, "<svg xmlns=\"http://www.w3.org/2000/svg\"{xlink} viewBox=\"0 0 {w} {h}\" width=\"{w}\" height=\"{h}\">")?;
+        match &stack {
+            Some(triples) => self.write_stack_defs(&mut file, triples, scale, detail)?,
+            None => write!(file, "{}", svg_lab_filter(w, h))?,
+        }
         if let Some(base) = self.alpha {
             let grey = |v: f64| hex(Color::rgb(v, v, v));
             writeln!(
@@ -248,6 +256,26 @@ impl Drawing {
             }
             writeln!(file, "  </mask>\n  <g mask=\"url(#alpha)\">")?;
         }
+        match &stack {
+            Some(triples) => self.write_stack(&mut file, triples)?,
+            None => self.write_plates(&mut file, scale, detail)?,
+        }
+        if self.alpha.is_some() {
+            writeln!(file, "  </g>")?;
+        }
+        writeln!(file, "</svg>")?;
+        file.flush()?;
+        Ok(())
+    }
+
+    /// The filtered picture: each plate lights its own channel.
+    fn write_plates(&self, file: &mut impl Write, scale: usize, detail: SvgDetail) -> Result<(), Error> {
+        let (w, h) = (self.w * scale, self.h * scale);
+        let encode = |channel: usize, v: f64| {
+            let mut c = [0.0; 3];
+            c[channel] = if channel == 0 { v / 100.0 } else { (v + 128.0) / 255.0 };
+            hex(Color::rgb(c[0], c[1], c[2]))
+        };
         writeln!(file, "  <g filter=\"url(#lab)\">\n    <rect width=\"{w}\" height=\"{h}\" fill=\"#000000\"/>")?;
         for (channel, base) in self.base.iter().enumerate() {
             writeln!(
@@ -257,17 +285,95 @@ impl Drawing {
             )?;
             for (_, _, value, curves) in self.masks.iter().filter(|m| m.0 == channel) {
                 write!(file, "    <path fill=\"{}\" d=\"", encode(channel, *value))?;
-                write_curves(&mut file, curves, scale, detail)?;
+                write_curves(file, curves, scale, detail)?;
                 writeln!(file, "\"/>")?;
             }
             writeln!(file, "    </g>")?;
         }
         writeln!(file, "  </g>")?;
-        if self.alpha.is_some() {
-            writeln!(file, "  </g>")?;
+        Ok(())
+    }
+
+    /// The (L*, a*, b*) levels some output pixel shows, always with the bottom
+    /// one (0, 0, 0), sorted. A level counts from 1 within its plate, and 0 is
+    /// the base. A pixel has the last level of each plate covering at least
+    /// half of it.
+    fn triples(&self, scale: usize) -> Result<Vec<[u32; 3]>, Error> {
+        let (w, h) = (self.w * scale, self.h * scale);
+        let raster = Rasterizer::new(w, h)?;
+        let mut pixels = vec![[0u32; 3]; w * h];
+        let mut next = [1u32; 3];
+        for (channel, _, _, curves) in self.masks.iter().filter(|m| m.0 < ALPHA) {
+            let coverage = raster.render(&contours(curves, scale)?, FILL_K)?;
+            for (pixel, m) in pixels.iter_mut().zip(coverage.pixels()) {
+                if *m >= 0.5 {
+                    pixel[*channel] = next[*channel];
+                }
+            }
+            next[*channel] += 1;
         }
-        writeln!(file, "</svg>")?;
-        file.flush()?;
+        pixels.push([0; 3]);
+        pixels.sort_unstable();
+        pixels.dedup();
+        Ok(pixels)
+    }
+
+    /// The outlines `write_stack` uses, each written once: L* and a* as clip
+    /// paths, b* as shapes to fill.
+    fn write_stack_defs(&self, file: &mut impl Write, triples: &[[u32; 3]], scale: usize, detail: SvgDetail) -> Result<(), Error> {
+        let (w, h) = (self.w * scale, self.h * scale);
+        writeln!(file, "  <defs>\n  <rect id=\"r\" width=\"{w}\" height=\"{h}\"/>")?;
+        for (channel, id) in STACK_IDS.iter().enumerate() {
+            for (i, (_, _, _, curves)) in self.masks.iter().filter(|m| m.0 == channel).enumerate() {
+                let level = i as u32 + 1;
+                if !triples.iter().any(|t| t[channel] == level) {
+                    continue;
+                }
+                let filled = channel == STACK_IDS.len() - 1;
+                if filled {
+                    write!(file, "  <path id=\"{id}{level}\" d=\"")?;
+                } else {
+                    write!(file, "  <clipPath id=\"{id}{level}\"><path d=\"")?;
+                }
+                write_curves(file, curves, scale, detail)?;
+                writeln!(file, "{}", if filled { "\"/>" } else { "\"/></clipPath>" })?;
+            }
+        }
+        writeln!(file, "  </defs>")?;
+        Ok(())
+    }
+
+    /// The picture without a filter: each triple painted in its colour over
+    /// the ones before it. A pixel is covered by the triples of levels covering
+    /// it, and the last of those in sorted order is its own, so nothing needs
+    /// to be cut out of what lies below, even where outlines are not nested.
+    ///
+    /// Edge draws into a clip's edge one shape at a time, and a pixel half
+    /// covered by every triple of a group would let wrong colours through, so
+    /// the opacity makes each clipped group one layer, clipped once (`isolation`
+    /// did not do this there).
+    fn write_stack(&self, file: &mut impl Write, triples: &[[u32; 3]]) -> Result<(), Error> {
+        let values: [Vec<f64>; 3] = std::array::from_fn(|channel| {
+            let masks = self.masks.iter().filter(|m| m.0 == channel).map(|m| m.2);
+            std::iter::once(self.base[channel]).chain(masks).collect()
+        });
+        let group = |channel: usize, level: u32| match level {
+            0 => "<g>".to_owned(),
+            _ => format!("<g opacity=\".999\" clip-path=\"url(#{}{level})\">", STACK_IDS[channel]),
+        };
+        for lightness in triples.chunk_by(|p, q| p[0] == q[0]) {
+            writeln!(file, "{}", group(0, lightness[0][0]))?;
+            for a in lightness.chunk_by(|p, q| p[1] == q[1]) {
+                writeln!(file, "{}", group(1, a[0][1]))?;
+                for [i, j, k] in a {
+                    let colour = hex(lab_to_rgb(values[0][*i as usize], values[1][*j as usize], values[2][*k as usize]));
+                    let shape = if *k == 0 { "r".to_owned() } else { format!("{}{k}", STACK_IDS[2]) };
+                    writeln!(file, "<use xlink:href=\"#{shape}\" fill=\"{colour}\"/>")?;
+                }
+                writeln!(file, "</g>")?;
+            }
+            writeln!(file, "</g>")?;
+        }
         Ok(())
     }
 
@@ -474,6 +580,91 @@ mod tests {
         let opaque = Drawing { w: 120, h: 120, base: [0.0; 3], alpha: None, masks: Vec::new() };
         assert!(!write(&opaque).contains("mask"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A disc as one curve: c_0 and c_1 of m = 2.
+    fn disc(x: f64, y: f64, r: f64) -> Curve {
+        (6, 2, vec![Complex::ZERO, Complex::ZERO, Complex::new(x, y), Complex::new(r, 0.0), Complex::ZERO])
+    }
+
+    fn no_filter_svg(drawing: &Drawing, name: &str) -> String {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("svg-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("stack.svg");
+        drawing.write_svg(&file, 1, SvgDetail { no_filter: true, ..SvgDetail::default() }).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        text
+    }
+
+    #[test]
+    fn a_stack_paints_only_the_combinations_some_pixel_shows() {
+        // L* and a* discs apart, and a b* disc that meets only the a* one.
+        let masks = vec![(0, 1, 50.0, vec![disc(30.0, 60.0, 20.0)]), (1, 1, 20.0, vec![disc(90.0, 60.0, 20.0)]), (2, 1, 30.0, vec![disc(105.0, 60.0, 20.0)])];
+        let drawing = Drawing { w: 130, h: 120, base: [10.0, 5.0, -5.0], alpha: None, masks };
+        let wanted = [[0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1], [1, 0, 0]];
+        assert_eq!(drawing.triples(1).unwrap(), wanted);
+        let text = no_filter_svg(&drawing, "stack");
+        assert!(!text.contains("filter") && !text.contains("mix-blend-mode"), "{text}");
+        assert_eq!(text.matches("<g").count(), text.matches("</g>").count());
+        // Each triple once, in order, in its own colour.
+        let paints: Vec<&str> = text.lines().filter(|l| l.starts_with("<use")).collect();
+        assert_eq!(paints.len(), wanted.len());
+        for (paint, [i, j, k]) in paints.iter().zip(wanted) {
+            let colour = hex(lab_to_rgb([10.0, 50.0][i as usize], [5.0, 20.0][j as usize], [-5.0, 30.0][k as usize]));
+            let shape = if k == 0 { "r".to_owned() } else { format!("b{k}") };
+            assert_eq!(*paint, format!("<use xlink:href=\"#{shape}\" fill=\"{colour}\"/>"));
+        }
+        // Every clip is its own layer, and each outline is written once.
+        for id in ["L1", "a1"] {
+            assert_eq!(text.matches(&format!("<clipPath id=\"{id}\"")).count(), 1, "{text}");
+            assert_eq!(text.matches(&format!("<g opacity=\".999\" clip-path=\"url(#{id})\">")).count(), 1, "{text}");
+        }
+        assert_eq!(text.matches("<path id=\"b1\"").count(), 1, "{text}");
+        assert_eq!(text.matches(" d=\"").count(), 3, "{text}");
+    }
+
+    #[test]
+    fn stacking_gives_each_pixel_the_bitmaps_colour_even_when_levels_are_not_nested() {
+        // The second L* level sticks out of the first, as fitted outlines can.
+        let discs = [(0, 45.0, 50.0, 30.0, 40.0), (0, 70.0, 50.0, 25.0, 70.0), (1, 60.0, 40.0, 28.0, 25.0), (2, 50.0, 65.0, 22.0, -20.0), (2, 70.0, 60.0, 20.0, 30.0)];
+        let masks = discs.iter().enumerate().map(|(i, (plate, x, y, r, value))| (*plate, i, *value, vec![disc(*x, *y, *r)])).collect();
+        let drawing = Drawing { w: 110, h: 100, base: [15.0, -10.0, 8.0], alpha: None, masks };
+        let triples = drawing.triples(1).unwrap();
+        let image = drawing.bitmap(1).unwrap();
+        let of_plate = |plate: usize| -> Vec<(f64, f64, f64, f64)> { discs.iter().filter(|d| d.0 == plate).map(|d| (d.1, d.2, d.3, d.4)).collect() };
+        let plates = [of_plate(0), of_plate(1), of_plate(2)];
+        let mut checked = 0;
+        for y in 0..drawing.h {
+            for x in 0..drawing.w {
+                let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                let distance = |d: &(f64, f64, f64, f64)| (px - d.0).hypot(py - d.1) - d.2;
+                if plates.iter().flatten().any(|d| distance(d).abs() < 2.0) {
+                    continue;
+                }
+                let covers = |plate: usize, level: u32| level == 0 || distance(&plates[plate][level as usize - 1]) < 0.0;
+                // What the stack leaves here: the last triple whose levels all cover it.
+                let top = triples.iter().rev().find(|t| (0..3).all(|p| covers(p, t[p]))).unwrap();
+                let value = |p: usize| if top[p] == 0 { drawing.base[p] } else { plates[p][top[p] as usize - 1].3 };
+                let painted = lab_to_rgb(value(0), value(1), value(2));
+                let drawn = image.get(x, y).unwrap();
+                assert!((painted.r - drawn.r).abs() + (painted.g - drawn.g).abs() + (painted.b - drawn.b).abs() < 1e-9, "({x}, {y}): {top:?}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 3000, "{checked}");
+    }
+
+    #[test]
+    fn a_stack_keeps_the_alpha_mask_and_always_has_a_bottom() {
+        // The L* level covers everything, so no pixel shows the base.
+        let masks = vec![(0, 1, 50.0, vec![disc(30.0, 30.0, 100.0)]), (ALPHA, 1, 1.0, vec![disc(30.0, 30.0, 20.0)])];
+        let drawing = Drawing { w: 60, h: 60, base: [10.0, 0.0, 0.0], alpha: Some(0.0), masks };
+        assert_eq!(drawing.triples(1).unwrap(), [[0, 0, 0], [1, 0, 0]]);
+        let text = no_filter_svg(&drawing, "stack-alpha");
+        let (mask, group, paint) = (text.find("<mask id=\"alpha\"").unwrap(), text.find("<g mask=\"url(#alpha)\">").unwrap(), text.find("<use").unwrap());
+        assert!(mask < group && group < paint, "{text}");
+        assert_eq!(text.matches("<g").count(), text.matches("</g>").count());
     }
 
     #[test]

@@ -35,6 +35,9 @@ fn fit_then_render_writes_the_named_files() {
     let (ok, error) = run(&["render", csv.to_str().unwrap(), "--out", out, "--svg", "--lines"]);
     assert!(ok, "{error}");
     assert!(dir.join("square_dft_keep0.5_largest_r2_s10_lines.svg").exists());
+    let (ok, error) = run(&["render", csv.to_str().unwrap(), "--out", out, "--svg", "--no-filter"]);
+    assert!(ok, "{error}");
+    assert!(dir.join("square_dft_keep0.5_largest_r2_s10_nofilter.svg").exists());
     assert!(dir.join("square_dft_keep0.5_largest_r2_s10.bmp").exists());
 }
 
@@ -239,6 +242,8 @@ fn bad_arguments_are_refused() {
         &["render", "a_coefficients.csv", "--keep", "0.5"],
         &["render", "a_coefficients.csv", "--bmp", "--decimals", "2"],
         &["render", "a_coefficients.csv", "--bmp", "--lines"],
+        &["render", "a_coefficients.csv", "--bmp", "--no-filter"],
+        &["fit", "a.bmp", "--no-filter"],
         &["fit", "a.bmp", "--lines"],
         &["pack", "a_coefficients.csv", "--lines"],
         &["render", "a_coefficients.csv", "--decimals", "9"],

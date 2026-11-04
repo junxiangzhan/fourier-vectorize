@@ -22,12 +22,14 @@ fourier-vectorize pack COEFFICIENTS.csv... [--out DIR] [--movement PX]
     Pack a CSV written by `fit --csv` into <name>_m<PX>.fvc, a small binary file that needs nothing
     else to be drawn. --movement is how far rounding the coefficients may move each curve, as an RMS
     in pixels (default 0.2), which costs accuracy.
-fourier-vectorize render FILE... [--out DIR] [--scale N] [--svg] [--bmp] [--lines] [--tolerance PX] [--decimals N]
+fourier-vectorize render FILE... [--out DIR] [--scale N] [--svg] [--bmp] [--lines] [--tolerance PX] [--decimals N] [--no-filter]
     Draw coefficients written by `fit` or `pack` as a browser SVG and/or a BMP, N times larger (default 1, both
     files). SVG only: outlines are cubic curves and lines, or with --lines lines only, whose corners
     show when enlarged; --tolerance is how far simplifying may move an outline, in output pixels
     (default 0.1; 0 drops only points exactly in line); --decimals is the coordinates' decimal places,
-    0..4 (default 1). Other settings go in the SVG's file name.
+    0..4 (default 1); --no-filter paints one colour per combination of levels through clip paths instead
+    of using an SVG filter, for software without filters, and is far slower to draw. Other settings go in
+    the SVG's file name.
 
 The default output directory is the current one.";
 
@@ -156,6 +158,10 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, Error
                 }
                 detail_option = true;
             }
+            "--no-filter" if is_render => {
+                detail.no_filter = true;
+                detail_option = true;
+            }
             "--movement" if is_fit || is_pack => {
                 let message = "--movement needs a distance above 0 pixels";
                 let distance: f64 = value(&mut args, message)?;
@@ -186,7 +192,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, Error
         Job::Pack { movement: movement.unwrap_or(DEFAULT_MOVEMENT) }
     } else {
         if detail_option && bmp && !svg {
-            return Err(Error::InvalidParameter("--lines, --tolerance and --decimals only change the SVG; a BMP is filled from the series"));
+            return Err(Error::InvalidParameter("--lines, --tolerance, --decimals and --no-filter only change the SVG; a BMP is filled from the series"));
         }
         if !svg && !bmp {
             (svg, bmp) = (true, true);

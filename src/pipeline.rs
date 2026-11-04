@@ -218,8 +218,8 @@ pub fn pack(output: &Path, path: &Path, movement: f64) -> Result<PathBuf, Error>
 }
 
 /// Draws a file written by `fit_image` or `pack`, `scale` times larger, as the browser SVG (when `svg` gives its detail) and/or a BMP, named after
-/// the file's stem (with _x<scale> when enlarged; an SVG also has _lines, _t<tolerance>
-/// and _d<decimals> when they differ from the defaults). The BMP is filled
+/// the file's stem (with _x<scale> when enlarged; an SVG also has _lines, _t<tolerance>,
+/// _d<decimals> and _nofilter when they differ from the defaults). The BMP is filled
 /// from the series itself. Returns the files written.
 pub fn render(output: &Path, path: &Path, scale: usize, svg: Option<SvgDetail>, bitmap: bool) -> Result<Vec<PathBuf>, Error> {
     let drawing = Drawing::load(path)?;
@@ -237,6 +237,9 @@ pub fn render(output: &Path, path: &Path, scale: usize, svg: Option<SvgDetail>, 
         }
         if detail.decimals != SvgDetail::default().decimals {
             name.push_str(&format!("_d{}", detail.decimals));
+        }
+        if detail.no_filter {
+            name.push_str("_nofilter");
         }
         let file = output.join(format!("{name}.svg"));
         drawing.write_svg(&file, scale, detail)?;
@@ -495,6 +498,9 @@ mod tests {
         assert!(size(&fine) > size(&base));
         let lines = render(&dir, &csv, 1, Some(SvgDetail { lines: true, ..SvgDetail::default() }), false).unwrap().remove(0);
         assert!(lines.ends_with("blocks_dft_lines.svg"), "{lines:?}");
+        let flat = render(&dir, &csv, 1, Some(SvgDetail { no_filter: true, ..SvgDetail::default() }), false).unwrap().remove(0);
+        assert!(flat.ends_with("blocks_dft_nofilter.svg"), "{flat:?}");
+        assert!(!std::fs::read_to_string(&flat).unwrap().contains("filter="));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
