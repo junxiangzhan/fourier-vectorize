@@ -112,15 +112,60 @@ pub(crate) fn contours(field: &[f64], w: usize, h: usize, level: f64) -> Vec<Vec
     result
 }
 
+/// A plate's levels, the thresholds between them, the outlines of each level
+/// above the first, and how many areas were dropped.
+pub(crate) type PlateOutlines = (Vec<f64>, Vec<f64>, Vec<Vec<Vec<Complex>>>, usize);
+
+/// A pixel with a wider range of alpha around it than this lies on an edge
+/// rather than in a gradual fade.
+const EDGE_RANGE: f64 = 0.5;
+
 /// The smooth outlines of one channel: its levels (k-means on the smoothed
-/// values), the thresholds between them (midpoints), and for each level
-/// j >= 1 the sub-pixel iso-lines at threshold j - 1. Areas under MIN_AREA
-/// pixels are dropped (islands vanish, small holes close); the count dropped
-/// is returned last.
-#[allow(clippy::type_complexity)]
-pub(crate) fn smooth_outlines(values: &[f64], w: usize, h: usize, count: usize) -> (Vec<f64>, Vec<f64>, Vec<Vec<Vec<Complex>>>, usize) {
+/// values), and from them `outlines_at`.
+pub(crate) fn smooth_outlines(values: &[f64], w: usize, h: usize, count: usize) -> PlateOutlines {
     let mut labels = kmeans_1d(values, count);
     let levels = levels_of(values, &mut labels);
+    outlines_at(levels, values, w, h)
+}
+
+/// The outlines of the alpha plate. Its first and last levels are exactly the
+/// lowest and highest alpha, so what is opaque stays opaque. Up to `count` - 2
+/// more come only from gradual fades: an antialiased edge is one iso-line
+/// placed to sub-pixel accuracy, and however many pixels lie on it, it needs no
+/// more.
+pub(crate) fn alpha_outlines(values: &[f64], w: usize, h: usize, count: usize) -> PlateOutlines {
+    let lowest = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let highest = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if lowest == highest {
+        return outlines_at(vec![lowest], values, w, h);
+    }
+    let fading: Vec<f64> = (0..values.len())
+        .filter(|&i| {
+            let (x, y) = (i % w, i / w);
+            let (mut low, mut high) = (values[i], values[i]);
+            for ny in y.saturating_sub(1)..(y + 2).min(h) {
+                for nx in x.saturating_sub(1)..(x + 2).min(w) {
+                    low = low.min(values[ny * w + nx]);
+                    high = high.max(values[ny * w + nx]);
+                }
+            }
+            values[i] > lowest && values[i] < highest && high - low < EDGE_RANGE
+        })
+        .map(|i| values[i])
+        .collect();
+    let mut levels = vec![lowest];
+    if !fading.is_empty() && count > 2 {
+        let mut labels = kmeans_1d(&fading, count - 2);
+        levels.extend(levels_of(&fading, &mut labels));
+    }
+    levels.push(highest);
+    outlines_at(levels, values, w, h)
+}
+
+/// `levels` with the thresholds between them (midpoints), and for each level
+/// j >= 1 the sub-pixel iso-lines of `values` at threshold j - 1. Areas under
+/// MIN_AREA pixels are dropped (islands vanish, small holes close).
+fn outlines_at(levels: Vec<f64>, values: &[f64], w: usize, h: usize) -> PlateOutlines {
     let thresholds: Vec<f64> = levels.windows(2).map(|p| (p[0] + p[1]) / 2.0).collect();
     let mut dropped = 0;
     let outlines = thresholds
@@ -142,6 +187,32 @@ pub(crate) fn smooth_outlines(values: &[f64], w: usize, h: usize, count: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alpha_levels_keep_the_ends_exact_and_spend_nothing_on_edges() {
+        // A left half opaque and a right half clear, with one antialiased
+        // column of each of several values between them.
+        let (w, h) = (20, 16);
+        let edge: Vec<f64> = (0..w * h)
+            .map(|i| match i % w {
+                x if x < 10 => 1.0,
+                10 => [0.2, 0.4, 0.6, 0.8][(i / w) % 4],
+                _ => 0.0,
+            })
+            .collect();
+        let (levels, thresholds, outlines, _) = alpha_outlines(&edge, w, h, 16);
+        assert_eq!(levels, [0.0, 1.0]);
+        assert_eq!(thresholds, [0.5]);
+        assert_eq!(outlines.len(), 1);
+        // A slow fade gets levels of its own, and the ends are still exact.
+        let fade: Vec<f64> = (0..w * h).map(|i| (i % w) as f64 / (w - 1) as f64).collect();
+        let (levels, _, outlines, _) = alpha_outlines(&fade, w, h, 8);
+        assert_eq!((levels[0], levels[levels.len() - 1], levels.len()), (0.0, 1.0, 8));
+        assert_eq!(outlines.len(), 7);
+        // Nothing to tell apart: no outlines at all.
+        let (levels, _, outlines, _) = alpha_outlines(&[0.5; 320], w, h, 16);
+        assert_eq!((levels, outlines.len()), (vec![0.5], 0));
+    }
 
     #[test]
     fn contours_are_sub_pixel_closed_and_oriented() {

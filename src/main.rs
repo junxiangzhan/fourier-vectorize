@@ -3,10 +3,11 @@ use fourier_vectorize::{fit_image, pack, render, Error, FitKind, FitOptions, Pru
 use std::{path::PathBuf, str::FromStr};
 
 const HELP: &str = "\
-fourier-vectorize fit IMAGE... [--out DIR] [--factor N] [--levels 32,16,16] [--method dft|refined|descent]
+fourier-vectorize fit IMAGE... [--out DIR] [--factor N] [--levels 32,16,16[,16]] [--method dft|refined|descent]
                       [--movement PX | --csv] [--keep SHARE [--prune largest|lowpass] [--rounds N] [--prune-steps N]]
     Fit a PNG, JPEG or uncompressed 24-bit BMP with Fourier series, whatever the file's extension. EXIF
-    orientation is applied, and transparent pixels are drawn over white.
+    orientation is applied. A picture with transparency keeps it in its SVG and is drawn over white in
+    its BMP and measures; the fourth number of --levels is for its fades.
     Writes <name>_<method>_m<PX>.fvc, a small binary file for `render`, and a JSON summary with mean dE
     and SSIM (default method: refined). --movement is how far rounding the coefficients may move each
     curve, as an RMS in pixels (default 0.2), which costs accuracy; --csv writes
@@ -86,13 +87,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, Error
                 options.factor = Some(factor);
             }
             "--levels" if is_fit => {
-                let message = "--levels needs three integers in 2..64, e.g. 32,16,16";
+                let message = "--levels needs three or four integers in 2..64, e.g. 32,16,16";
                 let list = args.next().ok_or(Error::InvalidParameter(message))?;
                 let values: Vec<usize> = list.split(',').filter_map(|v| v.parse().ok()).collect();
-                if values.len() != 3 || values.iter().any(|v| !(2..=64).contains(v)) {
+                if !(3..=4).contains(&values.len()) || values.iter().any(|v| !(2..=64).contains(v)) {
                     return Err(Error::InvalidParameter(message));
                 }
-                options.levels = [values[0], values[1], values[2]];
+                options.levels[..values.len()].copy_from_slice(&values);
             }
             "--method" if is_fit => {
                 options.kind = match args.next().as_deref() {

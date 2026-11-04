@@ -1,5 +1,7 @@
 //! Packed coefficients: a compact binary form of a coefficients file that also
-//! holds the canvas size and base levels, so it stands alone.
+//! holds the canvas size and base levels, so it stands alone. A picture with
+//! transparency has its own start, and one more base level, so that what
+//! cannot draw it refuses it and every other file stays as it was.
 //!
 //! Quantizing is what makes it small, and the only lossy step. Each curve has
 //! one step, from its count of kept coefficients K: every coefficient rounded
@@ -11,16 +13,27 @@
 //! The numbers are varints with |k| rising, compressed with LZMA2. Other byte
 //! layouts changed the size by about 1%, and a model of an adaptive arithmetic
 //! coder by at most 2%, so nothing more elaborate is used.
-use crate::{drawing::Drawing, fit::harmonics, Complex, Error};
+use crate::{
+    drawing::{Drawing, ALPHA},
+    fit::harmonics,
+    Complex, Error,
+};
 use lzma_rust2::{Lzma2Options, Lzma2Reader, Lzma2Writer};
 use std::io::{Read, Write};
 
 /// The start of every packed file: the format and its version.
-pub(crate) const MAGIC: &[u8; 4] = b"FVC1";
+const MAGIC: &[u8; 4] = b"FVC1";
+/// The start of a file with an alpha plate.
+const MAGIC_ALPHA: &[u8; 4] = b"FVC2";
 const PRESET: u32 = 9;
 /// The largest dictionary a file may ask a reader to allocate.
 const MAX_DICT: u32 = 64 << 20;
 const MIN_DICT: u32 = 1 << 16;
+
+/// Whether these bytes claim to be a packed file.
+pub(crate) fn is_packed(bytes: &[u8]) -> bool {
+    bytes.starts_with(MAGIC) || bytes.starts_with(MAGIC_ALPHA)
+}
 
 fn bad() -> Error {
     Error::InvalidParameter("not a valid packed coefficients file")
@@ -65,6 +78,9 @@ pub(crate) fn pack(drawing: &Drawing, movement: f64) -> Result<Vec<u8>, Error> {
     for base in drawing.base {
         put_float(&mut head, base);
     }
+    if let Some(base) = drawing.alpha {
+        put_float(&mut head, base);
+    }
     put_float(&mut head, movement);
     put(&mut head, drawing.masks.len() as u64);
     for (channel, level, value, curves) in &drawing.masks {
@@ -101,7 +117,7 @@ pub(crate) fn pack(drawing: &Drawing, movement: f64) -> Result<Vec<u8>, Error> {
     let mut options = Lzma2Options::with_preset(PRESET);
     let dict = u32::try_from(head.len()).unwrap_or(MAX_DICT).clamp(MIN_DICT, MAX_DICT);
     options.lzma_options.dict_size = dict;
-    let mut out = MAGIC.to_vec();
+    let mut out = if drawing.alpha.is_some() { MAGIC_ALPHA } else { MAGIC }.to_vec();
     out.extend_from_slice(&dict.to_le_bytes());
     let mut writer = Lzma2Writer::new(out, options);
     writer.write_all(&head)?;
@@ -155,7 +171,8 @@ impl Body<'_> {
 
 /// The drawing a packed file holds.
 pub(crate) fn unpack(bytes: &[u8]) -> Result<Drawing, Error> {
-    let rest = bytes.strip_prefix(MAGIC).ok_or_else(bad)?;
+    let has_alpha = bytes.starts_with(MAGIC_ALPHA);
+    let rest = bytes.strip_prefix(if has_alpha { MAGIC_ALPHA } else { MAGIC }).ok_or_else(bad)?;
     let (dict, stream) = rest.split_first_chunk::<4>().ok_or_else(bad)?;
     let dict = u32::from_le_bytes(*dict);
     if !(MIN_DICT..=MAX_DICT).contains(&dict) {
@@ -169,16 +186,17 @@ pub(crate) fn unpack(bytes: &[u8]) -> Result<Drawing, Error> {
         return Err(bad());
     }
     let base = [body.float()?, body.float()?, body.float()?];
+    let alpha = if has_alpha { Some(body.float()?) } else { None };
     let movement = body.float()?;
     if movement <= 0.0 {
         return Err(bad());
     }
-    let mut drawing = Drawing { w, h, base, masks: Vec::new() };
+    let mut drawing = Drawing { w, h, base, alpha, masks: Vec::new() };
     // Curves whose kept harmonics come later: mask, curve and kept count.
     let mut shape = Vec::new();
     for i in 0..body.size()? {
         let channel = usize::from(body.byte()?);
-        if channel > 2 {
+        if channel > ALPHA || (channel == ALPHA && !has_alpha) {
             return Err(bad());
         }
         let (level, value) = (body.size()?, body.float()?);
@@ -251,6 +269,7 @@ mod tests {
             w: 200,
             h: 120,
             base: [12.5, -3.25, 40.0],
+            alpha: None,
             masks: vec![
                 (0, 1, 33.25, vec![(whole, harmonics(whole), wave(harmonics(whole), 1))]),
                 (2, 7, -8.5, vec![(sparse, harmonics(sparse), wave(harmonics(sparse), 5)), (whole, harmonics(whole), wave(harmonics(whole), 1))]),
@@ -304,6 +323,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn an_alpha_plate_survives_and_only_its_own_kind_of_file_may_hold_one() {
+        let mut original = drawing();
+        assert!(pack(&original, 0.2).unwrap().starts_with(MAGIC));
+        assert_eq!(unpack(&pack(&original, 0.2).unwrap()).unwrap().alpha, None);
+        original.alpha = Some(0.25);
+        original.masks.push((ALPHA, 1, 1.0, original.masks[0].3.clone()));
+        let bytes = pack(&original, 0.2).unwrap();
+        assert!(bytes.starts_with(MAGIC_ALPHA) && is_packed(&bytes));
+        let back = unpack(&bytes).unwrap();
+        assert_eq!(back.alpha, Some(0.25));
+        assert_eq!((back.masks[2].0, back.masks[2].2), (ALPHA, 1.0));
+        // A file without the base level cannot have masks for that plate.
+        original.alpha = None;
+        assert!(unpack(&pack(&original, 0.2).unwrap()).is_err());
     }
 
     #[test]

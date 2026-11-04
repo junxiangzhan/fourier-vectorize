@@ -2,9 +2,9 @@
 //! reading and writing its coefficients.
 use crate::{
     bezier::{fit_loop, Segment},
-    color::{hex, lab_to_rgb, svg_lab_filter},
+    color::{hex, lab_to_rgb, over_white, svg_lab_filter},
     fit::{harmonics, samples},
-    packed::{unpack, MAGIC},
+    packed::{is_packed, unpack},
     Color, Complex, Error, Image, Rasterizer,
 };
 use std::{
@@ -22,16 +22,20 @@ pub(crate) type Curve = (usize, usize, Vec<Complex>);
 pub(crate) type Layer = (usize, usize, f64, Vec<Curve>);
 
 /// A picture as Fourier series: canvas size, each plate's base level, and
-/// its masks. Plates are L*, a*, b*; masks come in level order within each
-/// plate.
+/// its masks. Plates are L*, a*, b* and, for a picture with transparency,
+/// alpha; masks come in level order within each plate.
 pub(crate) struct Drawing {
     pub(crate) w: usize,
     pub(crate) h: usize,
     pub(crate) base: [f64; 3],
+    /// The alpha plate's base level, if the picture has one.
+    pub(crate) alpha: Option<f64>,
     pub(crate) masks: Vec<Layer>,
 }
 
-pub(crate) const PLATES: [&str; 3] = ["lightness", "a", "b"];
+pub(crate) const PLATES: [&str; 4] = ["lightness", "a", "b", "alpha"];
+/// The plate of `PLATES` that holds alpha.
+pub(crate) const ALPHA: usize = 3;
 
 /// How much detail an SVG's outlines keep.
 #[derive(Clone, Copy, PartialEq)]
@@ -154,15 +158,36 @@ fn directions(coefficients: &[Complex], m: usize, count: usize) -> Result<Vec<Co
     samples(&turned, m, count)
 }
 
+/// One level's curves as the data of one path.
+fn write_curves(file: &mut impl Write, curves: &[Curve], scale: usize, detail: SvgDetail) -> Result<(), Error> {
+    for (_, m, c) in curves {
+        let count = (4 * m).next_power_of_two().max(16) * scale.next_power_of_two();
+        let k = scale as f64;
+        let z: Vec<Complex> = samples(c, *m, count)?
+            .iter()
+            .map(|q| Complex { re: q.re * k, im: q.im * k })
+            .collect();
+        let data = if detail.lines {
+            path_data(&simplify(&z, detail.tolerance), detail.decimals)
+        } else {
+            let tangents = directions(c, *m, count)?;
+            segment_data(z[0], &fit_loop(&z, &tangents, detail.tolerance), detail.decimals)
+        };
+        write!(file, "{data}")?;
+    }
+    Ok(())
+}
+
 impl Drawing {
     /// Rendered `scale` times larger: each mask's curves are sampled as in
     /// the fits (s from the outline's points), times `scale`, and filled
-    /// together with the non-zero rule, each level over the ones below.
+    /// together with the non-zero rule, each level over the ones below. A
+    /// bitmap has no transparency, so any alpha is drawn over white.
     pub(crate) fn bitmap(&self, scale: usize) -> Result<Image<Color>, Error> {
         let (w, h) = (self.w * scale, self.h * scale);
         let raster = Rasterizer::new(w, h)?;
         let mut plates = Vec::new();
-        for base in self.base {
+        for base in self.base.into_iter().chain(self.alpha) {
             plates.push(Image::new(w, h, base)?);
         }
         for (channel, _, value, curves) in &self.masks {
@@ -182,8 +207,11 @@ impl Drawing {
         }
         let mut image = Image::new(w, h, Color::rgb(0.0, 0.0, 0.0))?;
         for i in 0..w * h {
-            *image.get_mut(i % w, i / w).unwrap() =
-                lab_to_rgb(plates[0].pixels()[i], plates[1].pixels()[i], plates[2].pixels()[i]);
+            let colour = lab_to_rgb(plates[0].pixels()[i], plates[1].pixels()[i], plates[2].pixels()[i]);
+            *image.get_mut(i % w, i / w).unwrap() = match plates.get(ALPHA) {
+                Some(alpha) => over_white(colour, alpha.pixels()[i]),
+                None => colour,
+            };
         }
         Ok(image)
     }
@@ -191,7 +219,8 @@ impl Drawing {
     /// The browser SVG, `scale` times larger: each plate lights only its own
     /// channel and the Lab filter turns the three channels back into RGB. A curve with m harmonics is sampled
     /// at 4m points (at least twice its highest frequency), times `scale`,
-    /// then simplified as `detail` says; one non-zero path per level.
+    /// then simplified as `detail` says; one non-zero path per level. An alpha
+    /// plate is drawn in grey as a mask over the filtered picture.
     pub(crate) fn write_svg(&self, path: &Path, scale: usize, detail: SvgDetail) -> Result<(), Error> {
         let (w, h) = (self.w * scale, self.h * scale);
         let encode = |channel: usize, v: f64| {
@@ -202,9 +231,24 @@ impl Drawing {
         let mut file = BufWriter::new(File::create(path)?);
         write!(
             file,
-            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {w} {h}\" width=\"{w}\" height=\"{h}\">\n{}  <g filter=\"url(#lab)\">\n    <rect width=\"{w}\" height=\"{h}\" fill=\"#000000\"/>\n",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {w} {h}\" width=\"{w}\" height=\"{h}\">\n{}",
             svg_lab_filter(w, h)
         )?;
+        if let Some(base) = self.alpha {
+            let grey = |v: f64| hex(Color::rgb(v, v, v));
+            writeln!(
+                file,
+                "  <mask id=\"alpha\" maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"{w}\" height=\"{h}\">\n    <rect width=\"{w}\" height=\"{h}\" fill=\"{}\"/>",
+                grey(base)
+            )?;
+            for (_, _, value, curves) in self.masks.iter().filter(|m| m.0 == ALPHA) {
+                write!(file, "    <path fill=\"{}\" d=\"", grey(*value))?;
+                write_curves(&mut file, curves, scale, detail)?;
+                writeln!(file, "\"/>")?;
+            }
+            writeln!(file, "  </mask>\n  <g mask=\"url(#alpha)\">")?;
+        }
+        writeln!(file, "  <g filter=\"url(#lab)\">\n    <rect width=\"{w}\" height=\"{h}\" fill=\"#000000\"/>")?;
         for (channel, base) in self.base.iter().enumerate() {
             writeln!(
                 file,
@@ -213,26 +257,16 @@ impl Drawing {
             )?;
             for (_, _, value, curves) in self.masks.iter().filter(|m| m.0 == channel) {
                 write!(file, "    <path fill=\"{}\" d=\"", encode(channel, *value))?;
-                for (_, m, c) in curves {
-                    let count = (4 * m).next_power_of_two().max(16) * scale.next_power_of_two();
-                    let k = scale as f64;
-                    let z: Vec<Complex> = samples(c, *m, count)?
-                        .iter()
-                        .map(|q| Complex { re: q.re * k, im: q.im * k })
-                        .collect();
-                    let data = if detail.lines {
-                        path_data(&simplify(&z, detail.tolerance), detail.decimals)
-                    } else {
-                        let tangents = directions(c, *m, count)?;
-                        segment_data(z[0], &fit_loop(&z, &tangents, detail.tolerance), detail.decimals)
-                    };
-                    write!(file, "{data}")?;
-                }
+                write_curves(&mut file, curves, scale, detail)?;
                 writeln!(file, "\"/>")?;
             }
             writeln!(file, "    </g>")?;
         }
-        writeln!(file, "  </g>\n</svg>")?;
+        writeln!(file, "  </g>")?;
+        if self.alpha.is_some() {
+            writeln!(file, "  </g>")?;
+        }
+        writeln!(file, "</svg>")?;
         file.flush()?;
         Ok(())
     }
@@ -263,7 +297,7 @@ impl Drawing {
     /// summary (the same stem, ending .json instead of _coefficients.csv).
     pub(crate) fn load(path: &Path) -> Result<Self, Error> {
         let bytes = std::fs::read(path)?;
-        if bytes.starts_with(MAGIC) {
+        if is_packed(&bytes) {
             unpack(&bytes)
         } else {
             Self::read(path)
@@ -283,10 +317,13 @@ impl Drawing {
         };
         let size = numbers_after("\"size\":[")?;
         let mut base = [0.0; 3];
-        for (channel, plate) in PLATES.iter().enumerate() {
+        for (channel, plate) in PLATES.iter().enumerate().take(ALPHA) {
             base[channel] = *numbers_after(&format!("\"{plate}\":{{\"levels\":["))?.first().ok_or_else(bad)?;
         }
-        let mut drawing = Drawing { w: size[0] as usize, h: size[1] as usize, base, masks: Vec::new() };
+        // Only a picture with transparency has this plate.
+        let key = format!("\"{}\":{{\"levels\":[", PLATES[ALPHA]);
+        let alpha = if summary.contains(&key) { Some(*numbers_after(&key)?.first().ok_or_else(bad)?) } else { None };
+        let mut drawing = Drawing { w: size[0] as usize, h: size[1] as usize, base, alpha, masks: Vec::new() };
         let expected = summary
             .split("\"coefficients\":")
             .nth(1)
@@ -301,6 +338,9 @@ impl Drawing {
                 return Err(bad());
             }
             let channel = PLATES.iter().position(|p| *p == f[0]).ok_or_else(bad)?;
+            if channel == ALPHA && alpha.is_none() {
+                return Err(bad());
+            }
             let number = |s: &str| s.parse::<f64>().map_err(|_| bad());
             let (level, value) = (f[1].parse::<usize>().map_err(|_| bad())?, number(f[2])?);
             let (outline, points, k) = (f[3].parse::<usize>().map_err(|_| bad())?, f[4].parse::<usize>().map_err(|_| bad())?, f[5].parse::<i64>().map_err(|_| bad())?);
@@ -391,7 +431,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // One circle, of radius 50 at (60, 60): c_0 and c_1 of m = 2.
         let c = vec![Complex::ZERO, Complex::ZERO, Complex::new(60.0, 60.0), Complex::new(50.0, 0.0), Complex::ZERO];
-        let drawing = Drawing { w: 120, h: 120, base: [0.0; 3], masks: vec![(0, 1, 50.0, vec![(6, 2, c)])] };
+        let drawing = Drawing { w: 120, h: 120, base: [0.0; 3], alpha: None, masks: vec![(0, 1, 50.0, vec![(6, 2, c)])] };
         let path_of = |lines: bool, scale: usize| {
             let file = dir.join("circle.svg");
             drawing.write_svg(&file, scale, SvgDetail { lines, ..SvgDetail::default() }).unwrap();
@@ -406,6 +446,33 @@ mod tests {
         // Enlarged, a few more curves do where lines need many more.
         let (curves, lines) = (path_of(false, 8), path_of(true, 8));
         assert!(curves.len() * 3 < lines.len(), "{} vs {}", curves.len(), lines.len());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_alpha_plate_masks_the_svg_and_lays_the_bitmap_over_white() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("svg-alpha-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Black all over, opaque only inside a circle of radius 50 at (60, 60).
+        let c = vec![Complex::ZERO, Complex::ZERO, Complex::new(60.0, 60.0), Complex::new(50.0, 0.0), Complex::ZERO];
+        let circle = vec![(ALPHA, 1, 1.0, vec![(6, 2, c)])];
+        let write = |drawing: &Drawing| {
+            let file = dir.join("alpha.svg");
+            drawing.write_svg(&file, 1, SvgDetail::default()).unwrap();
+            std::fs::read_to_string(&file).unwrap()
+        };
+        let masked = Drawing { w: 120, h: 120, base: [0.0; 3], alpha: Some(0.0), masks: circle };
+        let text = write(&masked);
+        let (mask, group, filter) = (text.find("<mask id=\"alpha\"").unwrap(), text.find("<g mask=\"url(#alpha)\">").unwrap(), text.find("<g filter=\"url(#lab)\">").unwrap());
+        assert!(mask < group && group < filter, "{text}");
+        assert_eq!(text.matches("<g").count(), text.matches("</g>").count());
+        assert!(text[mask..group].contains("fill=\"#000000\"") && text[mask..group].contains("<path fill=\"#ffffff\""), "{text}");
+        let image = masked.bitmap(1).unwrap();
+        assert_eq!(*image.get(2, 2).unwrap(), Color::rgb(1.0, 1.0, 1.0));
+        assert!(image.get(60, 60).unwrap().r < 0.01);
+        // Without a plate, nothing of it appears.
+        let opaque = Drawing { w: 120, h: 120, base: [0.0; 3], alpha: None, masks: Vec::new() };
+        assert!(!write(&opaque).contains("mask"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -1,13 +1,13 @@
 //! The two jobs: fitting a picture and writing its coefficients, and drawing
 //! coefficients.
 use crate::{
-    color::{delta_e, lab, ssim},
+    color::{delta_e, lab, over_white, ssim},
     decode::decode,
-    drawing::{Drawing, SvgDetail, PLATES},
+    drawing::{Drawing, SvgDetail, ALPHA, PLATES},
     fit::fit_all,
-    outline::smooth_outlines,
+    outline::{alpha_outlines, smooth_outlines},
     packed,
-    preprocess::{bilateral, shrink, shrink_factor},
+    preprocess::{bilateral, shrink, shrink_factor, shrink_transparent},
     prune::{prune_fits, Prune},
     Color, Complex, Error, FitKind, Image,
 };
@@ -29,8 +29,8 @@ pub struct FitOptions {
     /// Shrink by box-averaging this many pixels per side; `None` picks the
     /// smallest factor that brings the longer side to at most 2000 px.
     pub factor: Option<usize>,
-    /// Levels for L*, a*, b*.
-    pub levels: [usize; 3],
+    /// Levels for L*, a*, b* and, if the picture has any transparency, alpha.
+    pub levels: [usize; 4],
     pub kind: FitKind,
     pub prune: Option<Prune>,
     /// Write a packed file that lets rounding move each curve this far, as an
@@ -39,7 +39,7 @@ pub struct FitOptions {
 }
 impl Default for FitOptions {
     fn default() -> Self {
-        Self { factor: None, levels: [32, 16, 16], kind: FitKind::Refined, prune: None, movement: Some(DEFAULT_MOVEMENT) }
+        Self { factor: None, levels: [32, 16, 16, 16], kind: FitKind::Refined, prune: None, movement: Some(DEFAULT_MOVEMENT) }
     }
 }
 
@@ -84,12 +84,12 @@ pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<Fit
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or(Error::InvalidParameter("image path has no usable file name"))?;
-    let (source, transparent) = decode(&std::fs::read(path)?)?;
-    if transparent {
-        eprintln!("{name}: transparent pixels are drawn over white");
-    }
+    let (source, alpha) = decode(&std::fs::read(path)?)?;
     let factor = shrink_factor(source.width(), source.height(), LONGEST, options.factor);
-    let input = shrink(&source, factor)?;
+    let (input, alpha) = match alpha {
+        Some(alpha) => shrink_transparent(&source, &alpha, factor)?,
+        None => (shrink(&source, factor)?, None),
+    };
     let (w, h) = (input.width(), input.height());
     let smooth = bilateral(&input)?;
     let labs: Vec<[f64; 3]> = smooth.pixels().iter().map(|c| lab(*c)).collect();
@@ -102,11 +102,17 @@ pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<Fit
     // plate, level, value and the range of each mask's outlines.
     let mut outlines: Vec<Vec<Complex>> = Vec::new();
     let mut masks = Vec::new();
-    let (mut dropped, mut base) = (0, [0.0; 3]);
+    let (mut dropped, mut base) = (0, [0.0; 4]);
     let mut levels_json = Vec::new();
-    for (channel, plate) in PLATES.iter().enumerate() {
-        let values: Vec<f64> = labs.iter().map(|v| v[channel]).collect();
-        let (found_levels, thresholds, found, lost) = smooth_outlines(&values, w, h, options.levels[channel]);
+    let plates = if alpha.is_some() { PLATES.len() } else { ALPHA };
+    for (channel, plate) in PLATES.iter().enumerate().take(plates) {
+        let (found_levels, thresholds, found, lost) = match &alpha {
+            Some(alpha) if channel == ALPHA => alpha_outlines(alpha.pixels(), w, h, options.levels[channel]),
+            _ => {
+                let values: Vec<f64> = labs.iter().map(|v| v[channel]).collect();
+                smooth_outlines(&values, w, h, options.levels[channel])
+            }
+        };
         dropped += lost;
         levels_json.push(format!(
             "\"{plate}\":{{\"levels\":{},\"thresholds\":{}}}",
@@ -128,7 +134,8 @@ pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<Fit
     let drawing = Drawing {
         w,
         h,
-        base,
+        base: [base[0], base[1], base[2]],
+        alpha: alpha.is_some().then_some(base[ALPHA]),
         masks: masks
             .into_iter()
             .map(|(channel, level, value, range)| {
@@ -157,18 +164,29 @@ pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<Fit
         )
     });
     // Measured on the rendering that `render` gives at scale 1, so a packed
-    // file is measured after its rounding.
+    // file is measured after its rounding, and transparency over white.
+    let reference = match &alpha {
+        Some(alpha) => {
+            let mut flat = input.clone();
+            for (i, a) in alpha.pixels().iter().enumerate() {
+                let c = flat.get_mut(i % w, i / w).unwrap();
+                *c = over_white(*c, *a);
+            }
+            eight_bit(&flat)?
+        }
+        None => eight_bit(&input)?,
+    };
     let (file_name, measures, movement_json) = match options.movement {
         Some(movement) => {
             let bytes = packed::pack(&drawing, movement)?;
             let file_name = format!("{stem}_m{movement}.fvc");
             std::fs::write(output.join(&file_name), &bytes)?;
-            (file_name, measure(&packed::unpack(&bytes)?.bitmap(1)?, &eight_bit(&input)?)?, format!("\"movement\":{movement},"))
+            (file_name, measure(&packed::unpack(&bytes)?.bitmap(1)?, &reference)?, format!("\"movement\":{movement},"))
         }
         None => {
             let file_name = format!("{stem}_coefficients.csv");
             drawing.write_coefficients(&output.join(&file_name), options.prune.is_some())?;
-            (file_name, measure(&drawing.bitmap(1)?, &eight_bit(&input)?)?, String::new())
+            (file_name, measure(&drawing.bitmap(1)?, &reference)?, String::new())
         }
     };
     let summary = output.join(format!("{stem}.json"));
@@ -270,7 +288,7 @@ mod tests {
     }
 
     fn dft_options(prune: Option<Prune>) -> FitOptions {
-        FitOptions { factor: Some(1), levels: [4, 3, 3], kind: FitKind::Dft, prune, movement: None }
+        FitOptions { factor: Some(1), levels: [4, 3, 3, 4], kind: FitKind::Dft, prune, movement: None }
     }
 
     #[test]
@@ -385,6 +403,62 @@ mod tests {
         let fitted = fit_image(&dir, &path, &options).unwrap();
         assert!(fitted.coefficients.ends_with("blocks_dft_keep0.5_largest_r1_s10_m0.2.fvc"), "{:?}", fitted.coefficients);
         assert!(!render(&dir, &fitted.coefficients, 1, None, true).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The blocks with a clear left third and a soft fade down the right third.
+    /// The colour stored under fully clear pixels is `hidden`.
+    fn transparent_blocks(dir: &Path, name: &str, hidden: [u8; 3]) -> PathBuf {
+        let (w, h) = (48u32, 40u32);
+        let picture = ::image::RgbaImage::from_fn(w, h, |x, y| {
+            let alpha = match x {
+                0..16 => 0,
+                16..32 => 255,
+                _ => 255 - (y * 255 / (h - 1)) as u8,
+            };
+            let disc = (x as f64 - 24.0).hypot(y as f64 - 20.0) < 7.0;
+            let [r, g, b] = if alpha == 0 {
+                hidden
+            } else if disc {
+                [30, 50, 180]
+            } else {
+                [230, 215, 180]
+            };
+            ::image::Rgba([r, g, b, alpha])
+        });
+        let path = dir.join(name);
+        picture.save(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn transparency_survives_every_file_and_ignores_hidden_colours() {
+        let dir = scratch_dir("alpha");
+        let path = transparent_blocks(&dir, "clear.png", [0, 0, 0]);
+        let options = FitOptions { levels: [4, 3, 3, 6], ..dft_options(None) };
+        let summary = fit_image(&dir, &path, &options).unwrap().summary;
+        let text = std::fs::read_to_string(&summary).unwrap();
+        assert!(text.contains("\"alpha\":{\"levels\":[0.000000000,"), "{text}");
+        let csv = dir.join("clear_dft_coefficients.csv");
+        assert!(std::fs::read_to_string(&csv).unwrap().contains("\nalpha,"));
+        let recorded = mean_delta_e(&text);
+        assert!(recorded < 6.0, "{recorded}");
+        // From the CSV: masked, and the BMP measures as recorded, over white.
+        let written = render(&dir, &csv, 1, Some(SvgDetail::default()), true).unwrap();
+        assert!(std::fs::read_to_string(&written[0]).unwrap().contains("mask=\"url(#alpha)\""));
+        let redrawn = bmp::read(&std::fs::read(&written[1]).unwrap()).unwrap();
+        assert_eq!(*redrawn.get(4, 20).unwrap(), Color::rgb(1.0, 1.0, 1.0));
+        // Packed: the same plate, drawn about the same.
+        let fitted = fit_image(&dir, &path, &FitOptions { movement: Some(0.01), ..options }).unwrap();
+        assert!(fitted.coefficients.ends_with("clear_dft_m0.01.fvc"));
+        let written = render(&dir, &fitted.coefficients, 1, Some(SvgDetail::default()), true).unwrap();
+        assert!(std::fs::read_to_string(&written[0]).unwrap().contains("mask=\"url(#alpha)\""));
+        let packed = mean_delta_e(&std::fs::read_to_string(&fitted.summary).unwrap());
+        assert!((packed - recorded).abs() < 0.2, "{packed} vs {recorded}");
+        // What is stored under clear pixels makes no difference at all.
+        let other = transparent_blocks(&dir, "other.png", [255, 0, 200]);
+        let again = fit_image(&dir, &other, &FitOptions { movement: Some(0.01), ..options }).unwrap();
+        assert_eq!(std::fs::read(&again.coefficients).unwrap(), std::fs::read(&fitted.coefficients).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

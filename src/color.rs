@@ -61,6 +61,12 @@ pub(crate) fn lab_to_rgb(l: f64, a: f64, b: f64) -> Color {
     )
 }
 
+/// `color` with opacity `alpha` over a white ground.
+pub(crate) fn over_white(color: Color, alpha: f64) -> Color {
+    let blend = |v: f64| v.clamp(0.0, 1.0) * alpha + (1.0 - alpha);
+    Color::rgb(blend(color.r), blend(color.g), blend(color.b))
+}
+
 pub(crate) fn hex(color: Color) -> String {
     let c = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     format!("#{:02x}{:02x}{:02x}", c(color.r), c(color.g), c(color.b))

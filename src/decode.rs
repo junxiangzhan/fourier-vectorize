@@ -4,12 +4,11 @@ use ::image::{ImageDecoder, ImageFormat, ImageReader};
 use std::io::Cursor;
 
 /// Decodes a BMP, PNG or JPEG, told apart by their contents rather than the
-/// file name, and says whether it had any transparency. EXIF orientation is
-/// applied and transparent pixels are laid over white, whatever colour they
-/// store; embedded colour profiles are ignored.
-pub(crate) fn decode(bytes: &[u8]) -> Result<(Image<Color>, bool), Error> {
+/// file name, into its colours as stored and, if any pixel is not fully opaque,
+/// its alpha. EXIF orientation is applied; embedded colour profiles are ignored.
+pub(crate) fn decode(bytes: &[u8]) -> Result<(Image<Color>, Option<Image<f64>>), Error> {
     if bytes.starts_with(b"BM") {
-        return Ok((bmp::read(bytes)?, false));
+        return Ok((bmp::read(bytes)?, None));
     }
     match ::image::guess_format(bytes) {
         Ok(ImageFormat::Png) => {}
@@ -27,16 +26,16 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(Image<Color>, bool), Error> {
     // reader's v / 255.
     let decoded = decoded.into_rgba16();
     let mut image = Image::new(decoded.width() as usize, decoded.height() as usize, Color::rgb(0.0, 0.0, 0.0))?;
+    let mut alpha = Image::new(image.width(), image.height(), 1.0)?;
     let mut transparent = false;
     let channel = |v: u16| v as f64 / 65535.0;
     for (x, y, pixel) in decoded.enumerate_pixels() {
         let [r, g, b, a] = pixel.0;
         transparent |= a < u16::MAX;
-        // At full opacity this is exactly the stored value.
-        let over_white = |v: u16| channel(v) * channel(a) + (1.0 - channel(a));
-        *image.get_mut(x as usize, y as usize).unwrap() = Color::rgb(over_white(r), over_white(g), over_white(b));
+        *image.get_mut(x as usize, y as usize).unwrap() = Color::rgb(channel(r), channel(g), channel(b));
+        *alpha.get_mut(x as usize, y as usize).unwrap() = channel(a);
     }
-    Ok((image, transparent))
+    Ok((image, transparent.then_some(alpha)))
 }
 
 /// Whether a JPEG reaches its end-of-image marker. The decoder is lenient and
@@ -88,7 +87,7 @@ mod tests {
     fn png_pixels_equal_bmp_pixels_exactly() {
         let pixels = all_values();
         let expected = decode(&bmp_of(&pixels)).unwrap();
-        assert!(!expected.1);
+        assert!(expected.1.is_none());
         assert_eq!(decode(&png(&pixels, ExtendedColorType::Rgb8)).unwrap(), expected);
         // Opaque alpha and the same values widened to 16 bits change nothing.
         let rgba: Vec<u8> = pixels.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
@@ -210,28 +209,20 @@ mod tests {
     }
 
     #[test]
-    fn transparent_pixels_are_laid_over_white_whatever_they_store() {
-        // Clear black, half-clear black, half-clear red, opaque blue.
-        let pixels = [0, 0, 0, 0, 0, 0, 0, 128, 255, 0, 0, 128, 0, 0, 255, 255];
+    fn alpha_comes_back_beside_the_stored_colours() {
+        // Clear black, half-clear red, opaque blue, opaque white.
+        let pixels = [0, 0, 0, 0, 255, 0, 0, 51, 0, 0, 255, 255, 255, 255, 255, 255];
         let mut bytes = Vec::new();
         ::image::codecs::png::PngEncoder::new(&mut bytes).write_image(&pixels, 2, 2, ExtendedColorType::Rgba8).unwrap();
-        let (image, transparent) = decode(&bytes).unwrap();
-        assert!(transparent);
-        let half = 1.0 - 128.0 / 255.0;
-        let rgb = |x, y| {
-            let c = image.get(x, y).unwrap();
-            [c.r, c.g, c.b]
-        };
-        assert_eq!(rgb(0, 0), [1.0; 3]);
-        for (got, want) in rgb(1, 0).into_iter().zip([half; 3]).chain(rgb(0, 1).into_iter().zip([1.0, half, half])) {
-            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
-        }
-        assert_eq!(rgb(1, 1), [0.0, 0.0, 1.0]);
+        let (image, alpha) = decode(&bytes).unwrap();
+        let alpha = alpha.unwrap();
+        assert_eq!(alpha.pixels(), [0.0, 0.2, 1.0, 1.0]);
+        assert_eq!(*image.get(1, 0).unwrap(), Color::rgb(1.0, 0.0, 0.0));
         // Grey with alpha takes the same path.
         let mut bytes = Vec::new();
-        ::image::codecs::png::PngEncoder::new(&mut bytes).write_image(&[0, 0], 1, 1, ExtendedColorType::La8).unwrap();
-        let (image, transparent) = decode(&bytes).unwrap();
-        assert!(transparent);
+        ::image::codecs::png::PngEncoder::new(&mut bytes).write_image(&[255, 0], 1, 1, ExtendedColorType::La8).unwrap();
+        let (image, alpha) = decode(&bytes).unwrap();
+        assert_eq!(alpha.unwrap().pixels(), [0.0]);
         assert_eq!(*image.get(0, 0).unwrap(), Color::rgb(1.0, 1.0, 1.0));
     }
 

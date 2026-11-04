@@ -184,8 +184,6 @@ fn fit_alone_gives_what_render_needs() {
     let packed = dir.join("square_dft_m0.2.fvc");
     let printed = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(printed.contains(&format!("Fitted: {}", packed.display())), "{printed}");
-    // It said nothing about transparency, as the picture has none.
-    assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(!dir.join("square_dft_coefficients.csv").exists());
     let (ok, error) = run(&["render", packed.to_str().unwrap(), "--out", out, "--svg"]);
     assert!(ok, "{error}");
@@ -196,13 +194,20 @@ fn fit_alone_gives_what_render_needs() {
 }
 
 #[test]
-fn a_transparent_picture_is_mentioned() {
+fn a_transparent_picture_stays_transparent_in_its_svg() {
     let dir = fresh_dir("cli-test-transparent");
     let png = dir.join("clear.png");
     image::RgbaImage::from_fn(40, 32, |x, _| image::Rgba([20, 40, 200, if x < 20 { 255 } else { 0 }])).save(&png).unwrap();
-    let (ok, error) = run(&["fit", png.to_str().unwrap(), "--out", dir.to_str().unwrap(), "--factor", "1", "--levels", "4,3,3", "--method", "dft"]);
+    let out = dir.to_str().unwrap();
+    let (ok, error) = run(&["fit", png.to_str().unwrap(), "--out", out, "--factor", "1", "--levels", "4,3,3,8", "--method", "dft"]);
     assert!(ok, "{error}");
-    assert!(error.contains("transparent"), "{error}");
+    let packed = dir.join("clear_dft_m0.2.fvc");
+    let (ok, error) = run(&["render", packed.to_str().unwrap(), "--out", out]);
+    assert!(ok, "{error}");
+    let svg = std::fs::read_to_string(dir.join("clear_dft_m0.2.svg")).unwrap();
+    assert!(svg.contains("mask=\"url(#alpha)\""), "{svg}");
+    let bitmap = fourier_vectorize::bmp::read(&std::fs::read(dir.join("clear_dft_m0.2.bmp")).unwrap()).unwrap();
+    assert_eq!(*bitmap.get(35, 16).unwrap(), Color::rgb(1.0, 1.0, 1.0));
 }
 
 #[test]
@@ -227,6 +232,9 @@ fn bad_arguments_are_refused() {
         &["fit", "a.bmp", "--keep", "0.5", "--rounds", "0"],
         &["fit", "a.bmp", "--tolerance", "1"],
         &["fit", "a.bmp", "--levels", "1,2,3"],
+        &["fit", "a.bmp", "--levels", "2,2"],
+        &["fit", "a.bmp", "--levels", "2,2,2,2,2"],
+        &["fit", "a.bmp", "--levels", "2,2,2,1"],
         &["fit", "a.bmp", "--method", "magic"],
         &["render", "a_coefficients.csv", "--keep", "0.5"],
         &["render", "a_coefficients.csv", "--bmp", "--decimals", "2"],
