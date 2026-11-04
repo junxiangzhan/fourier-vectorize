@@ -10,6 +10,8 @@ pub enum Error {
     Allocation,
     NonFinite,
     InvalidParameter(&'static str),
+    /// A PNG or JPEG the decoder refused, with its reason.
+    Decode(String),
     Io(io::Error),
 }
 
@@ -28,6 +30,7 @@ impl fmt::Display for Error {
             Self::Allocation => write!(f, "unable to allocate requested storage"),
             Self::NonFinite => write!(f, "geometry and color values must be finite"),
             Self::InvalidParameter(message) => write!(f, "{message}"),
+            Self::Decode(message) => write!(f, "cannot decode image: {message}"),
             Self::Io(error) => error.fmt(f),
         }
     }

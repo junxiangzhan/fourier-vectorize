@@ -1,8 +1,8 @@
 //! The two jobs: fitting a picture and writing its coefficients, and drawing
 //! coefficients.
 use crate::{
-    bmp,
     color::{delta_e, lab, ssim},
+    decode::decode,
     drawing::{Drawing, SvgDetail, PLATES},
     fit::fit_all,
     outline::smooth_outlines,
@@ -57,7 +57,7 @@ fn json_list(values: &[f64], digits: usize) -> String {
     format!("[{}]", values.iter().map(|v| format!("{v:.digits$}")).collect::<Vec<_>>().join(","))
 }
 
-/// Fits one BMP and writes <name>_<fit>_coefficients.csv (every c_k of every
+/// Fits one BMP, PNG or JPEG and writes <name>_<fit>_coefficients.csv (every c_k of every
 /// outline) and <name>_<fit>.json (size, levels, counts, and mean ΔE and
 /// lightness SSIM of the rendering against the input). `render` draws the CSV
 /// as SVG or BMP at any scale. A pruned fit has the pruning settings in its
@@ -68,7 +68,7 @@ pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<Pat
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or(Error::InvalidParameter("image path has no usable file name"))?;
-    let source = bmp::read(&std::fs::read(path)?)?;
+    let source = decode(&std::fs::read(path)?)?;
     let factor = shrink_factor(source.width(), source.height(), LONGEST, options.factor);
     let input = shrink(&source, factor)?;
     let (w, h) = (input.width(), input.height());
@@ -191,7 +191,7 @@ pub fn render(output: &Path, path: &Path, scale: usize, svg: Option<SvgDetail>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prune::PruneBy;
+    use crate::{bmp, prune::PruneBy};
 
     /// Two colour blocks and a disc on a light ground, saved as blocks.bmp.
     fn blocks(dir: &Path) -> (Image<Color>, PathBuf) {

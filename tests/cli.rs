@@ -1,6 +1,9 @@
 //! The program as a user runs it.
 use fourier_vectorize::{Color, Image};
-use std::{path::Path, process::Command};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn run(args: &[&str]) -> (bool, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_fourier-vectorize")).args(args).output().unwrap();
@@ -30,6 +33,111 @@ fn fit_then_render_writes_the_named_files() {
     assert!(ok, "{error}");
     assert!(dir.join("square_dft_keep0.5_largest_r2_s10_t0.5_d0.svg").exists());
     assert!(dir.join("square_dft_keep0.5_largest_r2_s10.bmp").exists());
+}
+
+/// A fresh directory under target/ for one test.
+fn fresh_dir(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A blue square on a cream ground, with a slight ramp so that the pixels are
+/// not all round numbers.
+fn square() -> image::RgbImage {
+    image::RgbImage::from_fn(40, 32, |x, y| {
+        let ramp = (x + y) as u8;
+        if (8..30).contains(&x) && (6..26).contains(&y) {
+            image::Rgb([25 + ramp, 50, 180 - ramp])
+        } else {
+            image::Rgb([230, 215 - ramp, 180])
+        }
+    })
+}
+
+/// Fits `file` with cheap settings into its own directory, then returns the
+/// coefficients and the summary without its timing.
+fn fit_cheaply(file: &Path, out: &Path) -> (String, String) {
+    std::fs::create_dir_all(out).unwrap();
+    let (ok, error) = run(&["fit", file.to_str().unwrap(), "--out", out.to_str().unwrap(), "--factor", "1", "--levels", "8,4,4", "--method", "dft"]);
+    assert!(ok, "{file:?}: {error}");
+    let coefficients = std::fs::read_to_string(out.join("square_dft_coefficients.csv")).unwrap();
+    let summary = std::fs::read_to_string(out.join("square_dft.json")).unwrap();
+    let summary = summary.split("\"seconds\"").next().unwrap().to_owned();
+    (coefficients, summary)
+}
+
+#[test]
+fn png_and_bmp_of_the_same_pixels_give_identical_output() {
+    let dir = fresh_dir("cli-test-png");
+    let pixels = square();
+    let mut picture = Image::new(40, 32, Color::rgb(0.0, 0.0, 0.0)).unwrap();
+    for (x, y, p) in pixels.enumerate_pixels() {
+        let v = |c: u8| c as f64 / 255.0;
+        *picture.get_mut(x as usize, y as usize).unwrap() = Color::rgb(v(p[0]), v(p[1]), v(p[2]));
+    }
+    let bmp = dir.join("square.bmp");
+    picture.save_bmp(&bmp).unwrap();
+    let png = dir.join("square.png");
+    pixels.save(&png).unwrap();
+    let expected = fit_cheaply(&bmp, &dir.join("from-bmp"));
+    assert!(expected.0.lines().count() > 1, "the fit found no outlines");
+    assert_eq!(fit_cheaply(&png, &dir.join("from-png")), expected);
+}
+
+#[test]
+fn jpeg_fits_and_renders() {
+    let dir = fresh_dir("cli-test-jpeg");
+    let jpeg = dir.join("square.jpg");
+    square().save(&jpeg).unwrap();
+    let (coefficients, _) = fit_cheaply(&jpeg, &dir);
+    assert!(coefficients.lines().count() > 1, "the fit found no outlines");
+    let csv = dir.join("square_dft_coefficients.csv");
+    let (ok, error) = run(&["render", csv.to_str().unwrap(), "--out", dir.to_str().unwrap()]);
+    assert!(ok, "{error}");
+    assert!(dir.join("square_dft.svg").exists());
+    let redrawn = fourier_vectorize::bmp::read(&std::fs::read(dir.join("square_dft.bmp")).unwrap()).unwrap();
+    assert_eq!((redrawn.width(), redrawn.height()), (40, 32));
+}
+
+#[test]
+fn the_format_comes_from_the_contents_not_the_extension() {
+    let dir = fresh_dir("cli-test-extension");
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    square().write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    let misnamed = dir.join("square.bmp");
+    std::fs::write(&misnamed, bytes.into_inner()).unwrap();
+    fit_cheaply(&misnamed, &dir);
+}
+
+#[test]
+fn unsupported_or_corrupt_files_are_refused() {
+    let dir = fresh_dir("cli-test-corrupt");
+    let encoded = |format| {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        square().write_to(&mut bytes, format).unwrap();
+        bytes.into_inner()
+    };
+    let (png, jpeg) = (encoded(image::ImageFormat::Png), encoded(image::ImageFormat::Jpeg));
+    let mut flipped_png = png.clone();
+    let middle = flipped_png.len() / 2;
+    flipped_png[middle] ^= 0xFF;
+    for (name, bytes) in [
+        ("empty.png", &[][..]),
+        ("text.png", b"not a picture"),
+        ("animation.gif", b"GIF89a\x01\x00\x01\x00\x00\x00\x00;"),
+        ("cut.png", &png[..png.len() / 2]),
+        ("flipped.png", &flipped_png),
+        ("cut.jpg", &jpeg[..jpeg.len() / 2]),
+        ("header.jpg", &jpeg[..jpeg.len().min(20)]),
+        ("cut.bmp", b"BM\x00\x00"),
+    ] {
+        let file = dir.join(name);
+        std::fs::write(&file, bytes).unwrap();
+        let (ok, error) = run(&["fit", file.to_str().unwrap(), "--out", dir.to_str().unwrap()]);
+        assert!(!ok && error.starts_with("Error:"), "{name}: {error}");
+    }
 }
 
 #[test]

@@ -3,11 +3,12 @@ use fourier_vectorize::{fit_image, render, Error, FitKind, FitOptions, Prune, Pr
 use std::{path::PathBuf, str::FromStr};
 
 const HELP: &str = "\
-fourier-vectorize fit IMAGE.bmp... [--out DIR] [--factor N] [--levels 32,16,16] [--method dft|refined|descent]
+fourier-vectorize fit IMAGE... [--out DIR] [--factor N] [--levels 32,16,16] [--method dft|refined|descent]
                       [--keep SHARE [--prune largest|lowpass] [--rounds N] [--prune-steps N]]
-    Fit a 24-bit BMP with Fourier series. Writes <name>_<method>_coefficients.csv and a JSON summary
-    with mean dE and SSIM (default method: refined). --factor N shrinks by box-averaging N x N blocks;
-    without it, the smallest factor that brings the longer side to at most 2000 px is used.
+    Fit a PNG, JPEG or uncompressed 24-bit BMP with Fourier series, whatever the file's extension.
+    Writes <name>_<method>_coefficients.csv and a JSON summary with mean dE and SSIM (default method:
+    refined). --factor N shrinks by box-averaging N x N blocks; without it, the smallest factor that
+    brings the longer side to at most 2000 px is used.
     --keep drops coefficients until SHARE of them (0..1, exclusive) remain, then descends again, which
     costs accuracy. --prune picks them by size (largest, default) or lowest harmonics (lowpass);
     --rounds cuts in N equal ratios (default 1, all at once); --prune-steps is the total descent

@@ -6,6 +6,7 @@
 //! user trade size against accuracy: see [`Prune`] and [`SvgDetail`].
 pub mod bmp;
 mod color;
+mod decode;
 mod drawing;
 mod error;
 mod fit;

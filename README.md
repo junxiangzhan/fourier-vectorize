@@ -6,26 +6,24 @@
 
 ## 建置
 
-需要 Rust，沒有外部套件。
+需要 Rust。
 
 ```bash
 cargo build --release
 ```
 
-目前只讀 24-bit BMP。其他格式可用 `scripts/decode_images.py` 轉換（需要 Pillow）：
-
-```bash
-python scripts/decode_images.py photo.jpg
-```
-
 ## 使用
 
 ```bash
-fourier-vectorize fit photo.bmp --out output
+fourier-vectorize fit photo.jpg --out output
 fourier-vectorize render output/photo_refined_coefficients.csv --svg --out output
 ```
 
 `fit` 輸出 `<圖名>_<方法>_coefficients.csv`（每條輪廓的每個 c_k）與 `<圖名>_<方法>.json`（尺寸、各階數值、ΔE、SSIM）。`render` 讀回係數，畫成 SVG 和／或 BMP。
+
+`fit` 讀 PNG、JPEG 和未壓縮的 24-bit BMP，依檔案內容判斷格式，與副檔名無關。像素照檔案所存的值讀入，不做色彩管理：透明度、內嵌的色彩描述檔和 EXIF 方向都會被忽略，所以透明處會畫成它底下存的顏色，手機照片可能是橫的。解碼後超過 512 MB 的 PNG 或 JPEG 會被拒絕。
+
+輸出檔名只取圖名、不含副檔名，所以輸出到同一個資料夾時，`photo.png` 和 `photo.jpg` 會互相覆蓋。
 
 | `fit` 選項 | 作用 | 預設 |
 |---|---|---|
