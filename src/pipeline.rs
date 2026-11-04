@@ -172,7 +172,7 @@ pub fn pack(output: &Path, path: &Path, movement: f64) -> Result<PathBuf, Error>
 
 /// Draws a coefficients CSV written by `fit_image` or a file written by `pack`,
 /// `scale` times larger, as the browser SVG (when `svg` gives its detail) and/or a BMP, named after
-/// the CSV's stem (with _x<scale> when enlarged; an SVG also has _t<tolerance>
+/// the CSV's stem (with _x<scale> when enlarged; an SVG also has _lines, _t<tolerance>
 /// and _d<decimals> when they differ from the defaults). The BMP is filled
 /// from the series itself. Returns the files written.
 pub fn render(output: &Path, path: &Path, scale: usize, svg: Option<SvgDetail>, bitmap: bool) -> Result<Vec<PathBuf>, Error> {
@@ -183,6 +183,9 @@ pub fn render(output: &Path, path: &Path, scale: usize, svg: Option<SvgDetail>, 
     let mut written = Vec::new();
     if let Some(detail) = svg {
         let mut name = stem.clone();
+        if detail.lines {
+            name.push_str("_lines");
+        }
         if detail.tolerance != SvgDetail::default().tolerance {
             name.push_str(&format!("_t{}", detail.tolerance));
         }
@@ -353,7 +356,9 @@ mod tests {
         let (_, path) = blocks(&dir);
         fit_image(&dir, &path, &dft_options(None)).unwrap();
         let csv = dir.join("blocks_dft_coefficients.csv");
-        let svg = |tolerance: f64, decimals: u32| render(&dir, &csv, 1, Some(SvgDetail { tolerance, decimals }), false).unwrap().remove(0);
+        let svg = |tolerance: f64, decimals: u32| {
+            render(&dir, &csv, 1, Some(SvgDetail { tolerance, decimals, ..SvgDetail::default() }), false).unwrap().remove(0)
+        };
         let size = |file: &Path| std::fs::metadata(file).unwrap().len();
         let (base, coarse, rough, fine) = (svg(0.1, 1), svg(1.0, 1), svg(0.1, 0), svg(0.1, 2));
         assert!(base.ends_with("blocks_dft.svg"), "{base:?}");
@@ -363,6 +368,8 @@ mod tests {
         assert!(size(&coarse) < size(&base));
         assert!(size(&rough) < size(&base));
         assert!(size(&fine) > size(&base));
+        let lines = render(&dir, &csv, 1, Some(SvgDetail { lines: true, ..SvgDetail::default() }), false).unwrap().remove(0);
+        assert!(lines.ends_with("blocks_dft_lines.svg"), "{lines:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,6 +1,7 @@
 //! A picture as Fourier series: drawing it as a bitmap or a browser SVG, and
 //! reading and writing its coefficients.
 use crate::{
+    bezier::{fit_loop, Segment},
     color::{hex, lab_to_rgb, svg_lab_filter},
     fit::{harmonics, samples},
     packed::{unpack, MAGIC},
@@ -39,10 +40,13 @@ pub struct SvgDetail {
     pub tolerance: f64,
     /// Decimal places of the coordinates.
     pub decimals: u32,
+    /// Straight lines only, instead of curves where those are shorter. Corners
+    /// show when the SVG is enlarged.
+    pub lines: bool,
 }
 impl Default for SvgDetail {
     fn default() -> Self {
-        Self { tolerance: 0.1, decimals: 1 }
+        Self { tolerance: 0.1, decimals: 1, lines: false }
     }
 }
 
@@ -80,42 +84,74 @@ fn simplify(z: &[Complex], tolerance: f64) -> Vec<Complex> {
 /// the curve rounds to fewer than three distinct corners and so encloses
 /// nothing (a bare `l` would end the whole path in a browser).
 fn path_data(z: &[Complex], decimals: u32) -> String {
+    let segments: Vec<Segment> = z[1..].iter().map(|&end| Segment::Line { end }).collect();
+    segment_data(z[0], &segments, decimals)
+}
+
+/// A number of a path, separated from the one before only where it has to be.
+fn push_number(text: &mut String, v: i64, decimals: u32) {
+    if !text.ends_with(['M', 'l', 'c']) && v >= 0 {
+        text.push(' ');
+    }
     let unit = 10i64.pow(decimals);
-    let number = |text: &mut String, v: i64| {
-        if !text.ends_with(['M', 'l']) && v >= 0 {
-            text.push(' ');
-        }
-        let (whole, part) = (v.abs() / unit, v.abs() % unit);
-        let sign = if v < 0 { "-" } else { "" };
-        let part = format!("{part:0width$}", width = decimals as usize);
-        let part = part.trim_end_matches('0');
-        text.push_str(&match (whole, part.is_empty()) {
-            (_, true) => format!("{sign}{whole}"),
-            (0, false) => format!("{sign}.{part}"),
-            _ => format!("{sign}{whole}.{part}"),
-        });
-    };
-    let rounded = |q: &Complex| ((q.re * unit as f64).round() as i64, (q.im * unit as f64).round() as i64);
+    let (whole, part) = (v.abs() / unit, v.abs() % unit);
+    let sign = if v < 0 { "-" } else { "" };
+    let part = format!("{part:0width$}", width = decimals as usize);
+    let part = part.trim_end_matches('0');
+    text.push_str(&match (whole, part.is_empty()) {
+        (_, true) => format!("{sign}{whole}"),
+        (0, false) => format!("{sign}.{part}"),
+        _ => format!("{sign}{whole}.{part}"),
+    });
+}
+
+/// A closed subpath from `start` along `segments`, as `path_data` describes. A
+/// command letter is written only when it changes, and a closing line is left
+/// to the `z`.
+fn segment_data(start: Complex, segments: &[Segment], decimals: u32) -> String {
+    let unit = 10i64.pow(decimals) as f64;
+    let rounded = |q: Complex| ((q.re * unit).round() as i64, (q.im * unit).round() as i64);
+    let origin = rounded(start);
     let mut text = String::from("M");
-    let mut last = rounded(&z[0]);
-    number(&mut text, last.0);
-    number(&mut text, last.1);
-    text.push('l');
-    let mut steps = 0;
-    for q in &z[1..] {
-        let next = rounded(q);
-        if next != last {
-            number(&mut text, next.0 - last.0);
-            number(&mut text, next.1 - last.1);
-            last = next;
-            steps += 1;
+    push_number(&mut text, origin.0, decimals);
+    push_number(&mut text, origin.1, decimals);
+    let (mut last, mut letter, mut steps) = (origin, 'M', 0);
+    for (i, segment) in segments.iter().enumerate() {
+        let (command, points) = match *segment {
+            Segment::Line { end } if i + 1 == segments.len() && rounded(end) == origin => continue,
+            Segment::Line { end } => ('l', vec![rounded(end)]),
+            Segment::Cubic { first, second, end } => ('c', vec![rounded(first), rounded(second), rounded(end)]),
+        };
+        if points.iter().all(|point| *point == last) {
+            continue;
         }
+        if command != letter {
+            text.push(command);
+            letter = command;
+        }
+        for point in &points {
+            push_number(&mut text, point.0 - last.0, decimals);
+            push_number(&mut text, point.1 - last.1, decimals);
+        }
+        last = points[points.len() - 1];
+        steps += 1;
     }
     if steps < 2 {
         return String::new();
     }
     text.push('z');
     text
+}
+
+/// The curve's direction at each of its `count` samples, which is the series
+/// differentiated: each c_k times i*k, up to a constant factor.
+fn directions(coefficients: &[Complex], m: usize, count: usize) -> Result<Vec<Complex>, Error> {
+    let turned: Vec<Complex> = coefficients
+        .iter()
+        .enumerate()
+        .map(|(i, c)| *c * Complex::new(0.0, i as f64 - m as f64))
+        .collect();
+    samples(&turned, m, count)
 }
 
 impl Drawing {
@@ -184,7 +220,13 @@ impl Drawing {
                         .iter()
                         .map(|q| Complex { re: q.re * k, im: q.im * k })
                         .collect();
-                    write!(file, "{}", path_data(&simplify(&z, detail.tolerance), detail.decimals))?;
+                    let data = if detail.lines {
+                        path_data(&simplify(&z, detail.tolerance), detail.decimals)
+                    } else {
+                        let tangents = directions(c, *m, count)?;
+                        segment_data(z[0], &fit_loop(&z, &tangents, detail.tolerance), detail.decimals)
+                    };
+                    write!(file, "{data}")?;
                 }
                 writeln!(file, "\"/>")?;
             }
@@ -322,6 +364,49 @@ mod tests {
                 .fold(f64::INFINITY, f64::min);
             assert!(nearest <= 0.1 + 1e-9, "{nearest}");
         }
+    }
+
+    #[test]
+    fn segment_data_uses_a_letter_only_when_it_changes_and_leaves_the_closing_line_to_z() {
+        let at = |re: f64, im: f64| Complex { re, im };
+        let line = |re, im| Segment::Line { end: at(re, im) };
+        let curve = |a, b, c, d, e, f| Segment::Cubic { first: at(a, b), second: at(c, d), end: at(e, f) };
+        let segments = [
+            line(1.0, 0.0),
+            line(2.0, 0.0),
+            curve(2.0, 1.0, 3.0, 2.0, 3.0, 3.0),
+            curve(3.0, 3.5, 2.5, 4.0, 2.0, 4.0),
+            line(0.0, 4.0),
+            line(0.0, 0.0),
+        ];
+        assert_eq!(segment_data(at(0.0, 0.0), &segments, 1), "M0 0l1 0 1 0c0 1 1 2 1 3 0 .5-.5 1-1 1l-2 0z");
+        // Nothing to enclose once rounded: no subpath at all.
+        let tiny = [line(0.01, 0.0), curve(0.01, 0.01, 0.02, 0.01, 0.0, 0.01), line(0.0, 0.0)];
+        assert_eq!(segment_data(at(0.0, 0.0), &tiny, 1), "");
+    }
+
+    #[test]
+    fn svgs_use_curves_unless_told_to_use_lines() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("svg-curves-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // One circle, of radius 50 at (60, 60): c_0 and c_1 of m = 2.
+        let c = vec![Complex::ZERO, Complex::ZERO, Complex::new(60.0, 60.0), Complex::new(50.0, 0.0), Complex::ZERO];
+        let drawing = Drawing { w: 120, h: 120, base: [0.0; 3], masks: vec![(0, 1, 50.0, vec![(6, 2, c)])] };
+        let path_of = |lines: bool, scale: usize| {
+            let file = dir.join("circle.svg");
+            drawing.write_svg(&file, scale, SvgDetail { lines, ..SvgDetail::default() }).unwrap();
+            let text = std::fs::read_to_string(&file).unwrap();
+            let start = text.find(" d=\"").unwrap() + 4;
+            text[start..start + text[start..].find('"').unwrap()].to_string()
+        };
+        let (curves, lines) = (path_of(false, 1), path_of(true, 1));
+        assert!(curves.contains('c') && !curves.contains('l'), "{curves}");
+        assert!(lines.contains('l') && !lines.contains('c'), "{lines}");
+        assert!(curves.len() < lines.len(), "{curves} vs {lines}");
+        // Enlarged, a few more curves do where lines need many more.
+        let (curves, lines) = (path_of(false, 8), path_of(true, 8));
+        assert!(curves.len() * 3 < lines.len(), "{} vs {}", curves.len(), lines.len());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

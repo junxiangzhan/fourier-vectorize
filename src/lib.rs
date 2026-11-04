@@ -4,6 +4,7 @@
 //!
 //! [`fit_image`] writes the coefficients; [`render`] draws them. Both let the
 //! user trade size against accuracy: see [`Prune`] and [`SvgDetail`].
+mod bezier;
 pub mod bmp;
 mod color;
 mod decode;
