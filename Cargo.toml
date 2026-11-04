@@ -1,0 +1,17 @@
+[package]
+name = "fourier-vectorize"
+version = "0.1.0"
+edition = "2021"
+description = "Draws a picture as Fourier series, as a compact browser SVG"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/junxiangzhan/fourier-vectorize"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Fitting runs gradient descent per outline; without optimization the tests
+# take minutes.
+[profile.dev]
+opt-level = 2

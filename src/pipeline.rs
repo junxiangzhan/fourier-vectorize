@@ -1,0 +1,325 @@
+//! The two jobs: fitting a picture and writing its coefficients, and drawing
+//! coefficients.
+use crate::{
+    bmp,
+    color::{delta_e, lab, ssim},
+    drawing::{Drawing, SvgDetail, PLATES},
+    fit::fit_all,
+    outline::smooth_outlines,
+    preprocess::{bilateral, shrink, shrink_factor},
+    prune::{prune_fits, Prune},
+    Color, Complex, Error, FitKind, Image,
+};
+use std::path::{Path, PathBuf};
+
+/// Without a given factor, a picture is shrunk by the smallest factor that
+/// brings its longer side to at most this many pixels.
+const LONGEST: usize = 2000;
+/// A pixel differs visibly when ΔE exceeds this.
+const VISIBLE_DELTA_E: f64 = 10.0;
+
+/// How to fit a picture.
+#[derive(Clone, Copy)]
+pub struct FitOptions {
+    /// Shrink by box-averaging this many pixels per side; `None` picks the
+    /// smallest factor that brings the longer side to at most 2000 px.
+    pub factor: Option<usize>,
+    /// Levels for L*, a*, b*.
+    pub levels: [usize; 3],
+    pub kind: FitKind,
+    pub prune: Option<Prune>,
+}
+impl Default for FitOptions {
+    fn default() -> Self {
+        Self { factor: None, levels: [32, 16, 16], kind: FitKind::Refined, prune: None }
+    }
+}
+
+/// Rounds to the 8 bits a BMP stores, so every measure can be recomputed
+/// from the saved files.
+fn eight_bit(image: &Image<Color>) -> Result<Image<Color>, Error> {
+    let r = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() / 255.0;
+    image.map(|c| Color::rgb(r(c.r), r(c.g), r(c.b)))
+}
+
+fn measure(image: &Image<Color>, reference: &Image<Color>) -> Result<String, Error> {
+    let a = eight_bit(image)?;
+    let d: Vec<f64> = a.pixels().iter().zip(reference.pixels()).map(|(x, y)| delta_e(*x, *y)).collect();
+    Ok(format!(
+        "{{\"mean_delta_e\":{:.6},\"visible\":{},\"ssim\":{:.6}}}",
+        d.iter().sum::<f64>() / d.len() as f64,
+        d.iter().filter(|v| **v > VISIBLE_DELTA_E).count(),
+        ssim(&a, reference)
+    ))
+}
+
+fn json_list(values: &[f64], digits: usize) -> String {
+    format!("[{}]", values.iter().map(|v| format!("{v:.digits$}")).collect::<Vec<_>>().join(","))
+}
+
+/// Fits one BMP and writes <name>_<fit>_coefficients.csv (every c_k of every
+/// outline) and <name>_<fit>.json (size, levels, counts, and mean ΔE and
+/// lightness SSIM of the rendering against the input). `render` draws the CSV
+/// as SVG or BMP at any scale. A pruned fit has the pruning settings in its
+/// name too, so it never replaces another. Returns the summary's path.
+pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<PathBuf, Error> {
+    let started = std::time::Instant::now();
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or(Error::InvalidParameter("image path has no usable file name"))?;
+    let source = bmp::read(&std::fs::read(path)?)?;
+    let factor = shrink_factor(source.width(), source.height(), LONGEST, options.factor);
+    let input = shrink(&source, factor)?;
+    let (w, h) = (input.width(), input.height());
+    let smooth = bilateral(&input)?;
+    let labs: Vec<[f64; 3]> = smooth.pixels().iter().map(|c| lab(*c)).collect();
+    let fit_name = options.kind.name();
+    let stem = match options.prune {
+        Some(p) => format!("{name}_{fit_name}_keep{}_{}_r{}_s{}", p.keep, p.by.name(), p.rounds, p.steps),
+        None => format!("{name}_{fit_name}"),
+    };
+    // Every outline of every mask goes through one queue; `masks` remembers
+    // plate, level, value and the range of each mask's outlines.
+    let mut outlines: Vec<Vec<Complex>> = Vec::new();
+    let mut masks = Vec::new();
+    let (mut dropped, mut base) = (0, [0.0; 3]);
+    let mut levels_json = Vec::new();
+    for (channel, plate) in PLATES.iter().enumerate() {
+        let values: Vec<f64> = labs.iter().map(|v| v[channel]).collect();
+        let (found_levels, thresholds, found, lost) = smooth_outlines(&values, w, h, options.levels[channel]);
+        dropped += lost;
+        levels_json.push(format!(
+            "\"{plate}\":{{\"levels\":{},\"thresholds\":{}}}",
+            json_list(&found_levels, 9),
+            json_list(&thresholds, 9)
+        ));
+        for ((j, &value), loops) in found_levels.iter().enumerate().skip(1).zip(found) {
+            if !loops.is_empty() {
+                masks.push((channel, j, value, outlines.len()..outlines.len() + loops.len()));
+                outlines.extend(loops);
+            }
+        }
+        base[channel] = found_levels[0];
+    }
+    let mut fits = fit_all(&outlines, options.kind)?;
+    if let Some(p) = options.prune {
+        prune_fits(&outlines, &mut fits, p)?;
+    }
+    let drawing = Drawing {
+        w,
+        h,
+        base,
+        masks: masks
+            .into_iter()
+            .map(|(channel, level, value, range)| {
+                let curves = fits[range].iter().map(|f| (f.n, f.m, f.coefficients.clone())).collect();
+                (channel, level, value, curves)
+            })
+            .collect(),
+    };
+    let (mut points, mut coefficients, mut total, mut weighted) = (0usize, 0usize, 0usize, 0.0);
+    for f in &fits {
+        points += f.n;
+        total += 2 * f.m + 1;
+        let nonzero = f.coefficients.iter().filter(|c| c.re != 0.0 || c.im != 0.0).count();
+        coefficients += if options.prune.is_some() { nonzero } else { 2 * f.m + 1 };
+        weighted += f.n as f64 * f.loss.sqrt();
+    }
+    let prune_json = options.prune.map_or(String::new(), |p| {
+        let share = coefficients as f64 / total as f64;
+        println!("{stem}: kept {coefficients} of {total} coefficients ({:.1}%)", share * 100.0);
+        format!(
+            "\"prune\":{{\"keep\":{},\"by\":\"{}\",\"rounds\":{},\"steps\":{},\"total_coefficients\":{total},\"kept_share\":{share:.6}}},",
+            p.keep,
+            p.by.name(),
+            p.rounds,
+            p.steps
+        )
+    });
+    let file_name = format!("{stem}_coefficients.csv");
+    drawing.write_coefficients(&output.join(&file_name), options.prune.is_some())?;
+    // Measured on the rendering that `render` gives at scale 1.
+    let measures = measure(&drawing.bitmap(1)?, &eight_bit(&input)?)?;
+    let summary = output.join(format!("{stem}.json"));
+    std::fs::write(
+        &summary,
+        format!(
+            "{{\"image\":\"{name}\",\"source\":[{},{}],\"factor\":{factor},\"size\":[{w},{h}],\"fit\":\"{fit_name}\",{prune_json}\"levels\":{{{}}},\"outlines\":{},\"outline_points\":{points},\"coefficients\":{coefficients},\"dropped_small\":{dropped},\"edge_rms\":{:.6},\"measures\":{measures},\"coefficients_file\":\"{file_name}\",\"seconds\":{:.3}}}\n",
+            source.width(),
+            source.height(),
+            levels_json.join(","),
+            fits.len(),
+            weighted / points.max(1) as f64,
+            started.elapsed().as_secs_f64()
+        ),
+    )?;
+    Ok(summary)
+}
+
+/// Draws a coefficients CSV written by `fit_image`, `scale` times larger, as
+/// the browser SVG (when `svg` gives its detail) and/or a BMP, named after
+/// the CSV's stem (with _x<scale> when enlarged; an SVG also has _t<tolerance>
+/// and _d<decimals> when they differ from the defaults). The BMP is filled
+/// from the series itself. Returns the files written.
+pub fn render(output: &Path, path: &Path, scale: usize, svg: Option<SvgDetail>, bitmap: bool) -> Result<Vec<PathBuf>, Error> {
+    let drawing = Drawing::read(path)?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let stem = name.trim_end_matches("_coefficients.csv");
+    let stem = if scale == 1 { stem.to_owned() } else { format!("{stem}_x{scale}") };
+    let mut written = Vec::new();
+    if let Some(detail) = svg {
+        let mut name = stem.clone();
+        if detail.tolerance != SvgDetail::default().tolerance {
+            name.push_str(&format!("_t{}", detail.tolerance));
+        }
+        if detail.decimals != SvgDetail::default().decimals {
+            name.push_str(&format!("_d{}", detail.decimals));
+        }
+        let file = output.join(format!("{name}.svg"));
+        drawing.write_svg(&file, scale, detail)?;
+        written.push(file);
+    }
+    if bitmap {
+        let file = output.join(format!("{stem}.bmp"));
+        drawing.bitmap(scale)?.save_bmp(&file)?;
+        written.push(file);
+    }
+    Ok(written)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prune::PruneBy;
+
+    /// Two colour blocks and a disc on a light ground, saved as blocks.bmp.
+    fn blocks(dir: &Path) -> (Image<Color>, PathBuf) {
+        let (w, h) = (48, 40);
+        let mut picture = Image::new(w, h, Color::rgb(0.9, 0.85, 0.7)).unwrap();
+        for y in 0..h {
+            for x in 0..w {
+                let c = picture.get_mut(x, y).unwrap();
+                if (6..20).contains(&x) && (5..30).contains(&y) {
+                    *c = Color::rgb(0.8, 0.2, 0.1);
+                } else if ((x as f64 - 33.0).powi(2) + (y as f64 - 20.0).powi(2)).sqrt() < 9.0 {
+                    *c = Color::rgb(0.1, 0.2, 0.7);
+                }
+            }
+        }
+        let path = dir.join("blocks.bmp");
+        picture.save_bmp(&path).unwrap();
+        (picture, path)
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!(
+            "{name}-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mean_delta_e(text: &str) -> f64 {
+        text.split(r#""mean_delta_e":"#).nth(1).unwrap().split(',').next().unwrap().parse().unwrap()
+    }
+
+    fn dft_options(prune: Option<Prune>) -> FitOptions {
+        FitOptions { factor: Some(1), levels: [4, 3, 3], kind: FitKind::Dft, prune }
+    }
+
+    #[test]
+    fn render_redraws_a_fit_from_its_files() {
+        let dir = scratch_dir("render");
+        let (picture, path) = blocks(&dir);
+        let (w, h) = (picture.width(), picture.height());
+        let summary = fit_image(&dir, &path, &dft_options(None)).unwrap();
+        let recorded = mean_delta_e(&std::fs::read_to_string(&summary).unwrap());
+        let csv = dir.join("blocks_dft_coefficients.csv");
+        let written = render(&dir, &csv, 1, Some(SvgDetail::default()), true).unwrap();
+        assert_eq!(written.len(), 2);
+        assert!(std::fs::read_to_string(&written[0]).unwrap().contains(r##"filter="url(#lab)""##));
+        // Drawn from the file (coefficients rounded to 9 decimals), the
+        // picture measures as it did when it was fitted.
+        let redrawn = bmp::read(&std::fs::read(&written[1]).unwrap()).unwrap();
+        let again = mean_delta_e(&measure(&redrawn, &eight_bit(&picture).unwrap()).unwrap());
+        assert!((again - recorded).abs() < 1e-3, "{again} vs {recorded}");
+        assert!(recorded < 10.0, "{recorded}");
+        // Enlarged, the same series fills a canvas twice the size.
+        let large = render(&dir, &csv, 2, None, true).unwrap();
+        let enlarged = bmp::read(&std::fs::read(&large[0]).unwrap()).unwrap();
+        assert_eq!((enlarged.width(), enlarged.height()), (2 * w, 2 * h));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pruned_fits_are_sparse_and_redraw_as_measured() {
+        let dir = scratch_dir("prune");
+        let (picture, path) = blocks(&dir);
+        let reference = eight_bit(&picture).unwrap();
+        let rows = |file: &Path| std::fs::read_to_string(file).unwrap().lines().count() - 1;
+        fit_image(&dir, &path, &dft_options(None)).unwrap();
+        let dense = rows(&dir.join("blocks_dft_coefficients.csv"));
+        for (by, tag) in [(PruneBy::Largest, "largest"), (PruneBy::LowPass, "lowpass")] {
+            let prune = Prune { keep: 0.5, by, rounds: 2, steps: 20 };
+            let summary = fit_image(&dir, &path, &dft_options(Some(prune))).unwrap();
+            let stem = format!("blocks_dft_keep0.5_{tag}_r2_s20");
+            assert!(summary.ends_with(format!("{stem}.json")), "{summary:?}");
+            let csv = dir.join(format!("{stem}_coefficients.csv"));
+            let kept = rows(&csv);
+            assert!(kept < dense, "{kept} of {dense}");
+            let text = std::fs::read_to_string(&summary).unwrap();
+            assert!(text.contains(&format!("\"coefficients\":{kept},")), "{text}");
+            assert!(text.contains(&format!("\"total_coefficients\":{dense},")), "{text}");
+            // No curve collapsed (its centre and its turning term remain), and
+            // missing rows read as zero.
+            let drawing = Drawing::read(&csv).unwrap();
+            for (_, m, c) in drawing.masks.iter().flat_map(|m| &m.3) {
+                assert!(c[*m].abs() > 0.0 && c[*m - 1].abs().max(c[*m + 1].abs()) > 0.0);
+                if by == PruneBy::LowPass {
+                    let top = c.iter().rposition(|v| v.re != 0.0 || v.im != 0.0).unwrap() - *m;
+                    assert!(top <= ((2 * *m + 1) as f64 * 0.5 / 2.0).round() as usize + 1, "{top} of {m}");
+                }
+            }
+            // Drawn from the sparse file, it measures as it did when fitted.
+            let written = render(&dir, &csv, 1, None, true).unwrap();
+            let redrawn = bmp::read(&std::fs::read(&written[0]).unwrap()).unwrap();
+            let again = mean_delta_e(&measure(&redrawn, &reference).unwrap());
+            assert!((again - mean_delta_e(&text)).abs() < 1e-3, "{again} vs {text}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cut_off_coefficients_file_is_refused() {
+        let dir = scratch_dir("cutoff");
+        let (_, path) = blocks(&dir);
+        fit_image(&dir, &path, &dft_options(None)).unwrap();
+        let csv = dir.join("blocks_dft_coefficients.csv");
+        let text = std::fs::read_to_string(&csv).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        std::fs::write(&csv, lines[..lines.len() - 1].join("\n")).unwrap();
+        assert!(render(&dir, &csv, 1, None, true).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn svg_detail_trades_size_and_names_the_file() {
+        let dir = scratch_dir("detail");
+        let (_, path) = blocks(&dir);
+        fit_image(&dir, &path, &dft_options(None)).unwrap();
+        let csv = dir.join("blocks_dft_coefficients.csv");
+        let svg = |tolerance: f64, decimals: u32| render(&dir, &csv, 1, Some(SvgDetail { tolerance, decimals }), false).unwrap().remove(0);
+        let size = |file: &Path| std::fs::metadata(file).unwrap().len();
+        let (base, coarse, rough, fine) = (svg(0.1, 1), svg(1.0, 1), svg(0.1, 0), svg(0.1, 2));
+        assert!(base.ends_with("blocks_dft.svg"), "{base:?}");
+        assert!(coarse.ends_with("blocks_dft_t1.svg"), "{coarse:?}");
+        assert!(rough.ends_with("blocks_dft_d0.svg"), "{rough:?}");
+        assert!(fine.ends_with("blocks_dft_d2.svg"), "{fine:?}");
+        assert!(size(&coarse) < size(&base));
+        assert!(size(&rough) < size(&base));
+        assert!(size(&fine) > size(&base));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

@@ -1,0 +1,66 @@
+# fourier-vectorize
+
+把一張圖畫成傅立葉級數，輸出可以直接用瀏覽器開啟的 SVG，也能從級數放大到任意倍率。
+
+做法：雙邊濾波後，把 Lab 三個通道各切成數階（預設 32 + 16 + 16），每階的次像素輪廓各擬合一條傅立葉級數，再用梯度下降修正。SVG 裡每個通道是一張版，由 SVG 濾鏡轉回 RGB。
+
+## 建置
+
+需要 Rust，沒有外部套件。
+
+```bash
+cargo build --release
+```
+
+目前只讀 24-bit BMP。其他格式可用 `scripts/decode_images.py` 轉換（需要 Pillow）：
+
+```bash
+python scripts/decode_images.py photo.jpg
+```
+
+## 使用
+
+```bash
+fourier-vectorize fit photo.bmp --out output
+fourier-vectorize render output/photo_refined_coefficients.csv --svg --out output
+```
+
+`fit` 輸出 `<圖名>_<方法>_coefficients.csv`（每條輪廓的每個 c_k）與 `<圖名>_<方法>.json`（尺寸、各階數值、ΔE、SSIM）。`render` 讀回係數，畫成 SVG 和／或 BMP。
+
+| `fit` 選項 | 作用 | 預設 |
+|---|---|---|
+| `--factor N` | 以 N×N 區塊平均縮小 | 長邊縮到不超過 2000 px 的最小倍數 |
+| `--levels L,a,b` | 三個通道的階數（2..64） | `32,16,16` |
+| `--method dft\|refined\|descent` | DFT、DFT 加梯度下降、只從圓開始梯度下降 | `refined` |
+
+| `render` 選項 | 作用 | 預設 |
+|---|---|---|
+| `--scale N` | 從級數放大 N 倍（1..16），不經點陣重取樣 | 1 |
+| `--svg`、`--bmp` | 輸出哪種檔案 | 兩種都輸出 |
+
+## 檔案大小的取捨
+
+這些參數由使用者決定，程式不會自動選擇。
+
+| 選項 | 作用 | 預設 | 是否失真 |
+|---|---|---|---|
+| `fit --keep 比例` | 刪減係數到指定比例（0 到 1 之間），再以梯度下降修正；係數檔只含留下的係數 | 不刪 | 是 |
+| `fit --prune largest\|lowpass` | 依 \|c_k\| 大小，或只留低頻。低通在低比例時留下的會多於指定比例，k = −1、0、1 一律保留 | `largest` | |
+| `fit --rounds N` | 分 N 次、每次按相同比率刪到目標；1 為一次刪完 | 1 | |
+| `fit --prune-steps N` | 梯度下降總步數：一半分給各輪，一半留給最後的係數集 | 400 | |
+| `render --tolerance PX` | 簡化 SVG 輪廓時可移動的距離（輸出像素）；0 只刪完全共線的點 | 0.1 | 是 |
+| `render --decimals N` | SVG 座標小數位數（0..4） | 1 | 是 |
+
+SVG 一律使用相對座標，這一步本身不損失資訊。設定會記錄在檔名裡（如 `photo_refined_keep0.17_largest_r8_s400_coefficients.csv`、`photo_refined_t0.5_d0.svg`），不同設定不會互相覆蓋。BMP 直接由級數填色，不受 `--tolerance` 與 `--decimals` 影響。
+
+在兩幅畫上的實驗（各 4 個比例）：保留約 11% 以上時，多輪略優（如 8 輪、400 步保留約 17%）；約 7% 以下則一次刪的色差較小。選法則因畫而異。樣本很少，只能當起點參考。
+
+## 開發
+
+```bash
+cargo test
+```
+
+## 授權
+
+可依 [MIT](LICENSE-MIT) 或 [Apache 2.0](LICENSE-APACHE) 任選其一使用。除非另有聲明，你提交的貢獻也視為依這兩種授權釋出，不附加其他條款。
