@@ -1,6 +1,8 @@
 //! Draws a picture as Fourier series. Each Lab channel is cut into levels,
 //! each level's outlines are fitted with a Fourier series, and the result is
 //! drawn straight from the series, as a browser SVG or a bitmap, at any scale.
+//! A picture can instead be painted in a table of colours, one level per colour
+//! (see [`FitOptions::palette`]).
 //!
 //! [`fit_image`] writes the coefficients; [`render`] draws them. Both let the
 //! user trade size against accuracy: see [`Prune`] and [`SvgDetail`].
@@ -14,6 +16,7 @@ mod fit;
 mod fourier;
 mod image;
 mod outline;
+mod palette;
 mod packed;
 mod pipeline;
 mod preprocess;
@@ -25,6 +28,6 @@ pub use error::Error;
 pub use fit::FitKind;
 pub use fourier::{fft, Complex};
 pub use image::{Color, Image};
-pub use pipeline::{fit_image, pack, render, FitOptions, Fitted, DEFAULT_MOVEMENT};
+pub use pipeline::{fit_image, pack, render, FitOptions, Fitted, DEFAULT_MOVEMENT, DEFAULT_REDUCE};
 pub use prune::{Prune, PruneBy};
 pub use raster::Rasterizer;

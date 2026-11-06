@@ -3,8 +3,8 @@ use fourier_vectorize::{fit_image, pack, render, Error, FitKind, FitOptions, Pru
 use std::{path::PathBuf, str::FromStr};
 
 const HELP: &str = "\
-fourier-vectorize fit IMAGE... [--out DIR] [--factor N] [--levels 32,16,16[,16]] [--method dft|refined|descent]
-                      [--movement PX | --csv] [--keep SHARE [--prune largest|lowpass] [--rounds N] [--prune-steps N]]
+fourier-vectorize fit IMAGE... [--out DIR] [--factor N] [--levels 32,16,16[,16]] [--palette N] [--method dft|refined|descent]
+                      [--movement PX | --csv] [--reduce PX | --keep SHARE [--prune largest|lowpass] [--rounds N] [--prune-steps N]]
     Fit a PNG, JPEG or uncompressed 24-bit BMP with Fourier series, whatever the file's extension. EXIF
     orientation is applied. A picture with transparency keeps it in its SVG and is drawn over white in
     its BMP and measures; the fourth number of --levels is for its fades.
@@ -12,8 +12,13 @@ fourier-vectorize fit IMAGE... [--out DIR] [--factor N] [--levels 32,16,16[,16]]
     and SSIM (default method: refined). --movement is how far rounding the coefficients may move each
     curve, as an RMS in pixels (default 0.2), which costs accuracy; --csv writes
     <name>_<method>_coefficients.csv instead, which is far larger and can be packed later.
+    --palette N paints the picture in a table of up to N colours (2..1024), each one shape over the ones
+    before, instead of the L*, a* and b* plates, so the SVG needs no filter; --levels then sets only the
+    fades. It goes in the file name, and only in a packed file.
     --factor N shrinks by box-averaging N x N blocks; without it, the smallest factor that brings the
     longer side to at most 2000 px is used.
+    --reduce gives each curve only the harmonics it needs to stay this close, as an RMS in pixels
+    (default 0.3; 0 keeps them all), which costs accuracy. Other values go in the file name.
     --keep drops coefficients until SHARE of them (0..1, exclusive) remain, then descends again, which
     costs accuracy. --prune picks them by size (largest, default) or lowest harmonics (lowpass);
     --rounds cuts in N equal ratios (default 1, all at once); --prune-steps is the total descent
@@ -73,6 +78,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, Error
     let mut detail_option = false;
     let mut movement = None;
     let mut csv = false;
+    let mut reduce_option = false;
     let is_render = !is_fit && !is_pack;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -96,6 +102,14 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, Error
                     return Err(Error::InvalidParameter(message));
                 }
                 options.levels[..values.len()].copy_from_slice(&values);
+            }
+            "--palette" if is_fit => {
+                let message = "--palette needs a number of colours in 2..1024";
+                let colours: usize = value(&mut args, message)?;
+                if !(2..=1024).contains(&colours) {
+                    return Err(Error::InvalidParameter(message));
+                }
+                options.palette = Some(colours);
             }
             "--method" if is_fit => {
                 options.kind = match args.next().as_deref() {
@@ -130,6 +144,15 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, Error
             "--prune-steps" if is_fit => {
                 prune.steps = value(&mut args, "--prune-steps needs an integer")?;
                 prune_option = true;
+            }
+            "--reduce" if is_fit => {
+                let message = "--reduce needs a distance of at least 0 pixels";
+                let budget: f64 = value(&mut args, message)?;
+                if !(budget >= 0.0 && budget.is_finite()) {
+                    return Err(Error::InvalidParameter(message));
+                }
+                options.reduce = (budget > 0.0).then_some(budget);
+                reduce_option = true;
             }
             "--scale" if is_render => {
                 scale = value(&mut args, "--scale needs an integer in 1..16")?;
@@ -182,8 +205,14 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, Error
         if prune_option && prune.keep >= 1.0 {
             return Err(Error::InvalidParameter("--prune, --rounds and --prune-steps need --keep"));
         }
+        if csv && options.palette.is_some() {
+            return Err(Error::InvalidParameter("--palette needs a packed file; --csv writes a CSV, which holds plates only"));
+        }
         if csv && movement.is_some() {
             return Err(Error::InvalidParameter("--movement sets the rounding of a packed file; --csv writes a CSV instead"));
+        }
+        if reduce_option && prune.keep < 1.0 {
+            return Err(Error::InvalidParameter("--reduce and --keep are two ways to drop coefficients; use one"));
         }
         options.prune = (prune.keep < 1.0).then_some(prune);
         options.movement = (!csv).then_some(movement.unwrap_or(DEFAULT_MOVEMENT));

@@ -1,14 +1,14 @@
 //! The two jobs: fitting a picture and writing its coefficients, and drawing
 //! coefficients.
 use crate::{
-    color::{delta_e, lab, over_white, ssim},
+    color::{delta_e, lab, lab_to_rgb, over_white, ssim},
     decode::decode,
     drawing::{Drawing, SvgDetail, ALPHA, PLATES},
     fit::fit_all,
     outline::{alpha_outlines, smooth_outlines},
-    packed,
+    packed, palette,
     preprocess::{bilateral, shrink, shrink_factor, shrink_transparent},
-    prune::{prune_fits, Prune},
+    prune::{prune_fits, reduce_fits, Prune},
     Color, Complex, Error, FitKind, Image,
 };
 use std::path::{Path, PathBuf};
@@ -22,6 +22,9 @@ const VISIBLE_DELTA_E: f64 = 10.0;
 /// How far `fit` and `pack` let rounding move each curve unless told otherwise,
 /// as an RMS in pixels.
 pub const DEFAULT_MOVEMENT: f64 = 0.2;
+/// How far `fit` lets dropping harmonics move each curve unless told otherwise,
+/// as an RMS in pixels.
+pub const DEFAULT_REDUCE: f64 = 0.3;
 
 /// How to fit a picture.
 #[derive(Clone, Copy)]
@@ -33,13 +36,19 @@ pub struct FitOptions {
     pub levels: [usize; 4],
     pub kind: FitKind,
     pub prune: Option<Prune>,
+    /// Give each curve only the harmonics it needs to stay this close, as an
+    /// RMS in pixels. Not used together with `prune`.
+    pub reduce: Option<f64>,
     /// Write a packed file that lets rounding move each curve this far, as an
     /// RMS in pixels; `None` writes a CSV instead, which rounds far less.
     pub movement: Option<f64>,
+    /// Paint the picture in a table of up to this many colours instead of
+    /// the L*, a* and b* plates; only a packed file can hold one.
+    pub palette: Option<usize>,
 }
 impl Default for FitOptions {
     fn default() -> Self {
-        Self { factor: None, levels: [32, 16, 16, 16], kind: FitKind::Refined, prune: None, movement: Some(DEFAULT_MOVEMENT) }
+        Self { factor: None, levels: [32, 16, 16, 16], kind: FitKind::Refined, prune: None, reduce: Some(DEFAULT_REDUCE), movement: Some(DEFAULT_MOVEMENT), palette: None }
     }
 }
 
@@ -80,6 +89,9 @@ pub struct Fitted {
 /// replaces another.
 pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<Fitted, Error> {
     let started = std::time::Instant::now();
+    if options.palette.is_some() && options.movement.is_none() {
+        return Err(Error::InvalidParameter("a colour table goes only in a packed file, not a CSV"));
+    }
     let name = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -94,9 +106,17 @@ pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<Fit
     let smooth = bilateral(&input)?;
     let labs: Vec<[f64; 3]> = smooth.pixels().iter().map(|c| lab(*c)).collect();
     let fit_name = options.kind.name();
-    let stem = match options.prune {
-        Some(p) => format!("{name}_{fit_name}_keep{}_{}_r{}_s{}", p.keep, p.by.name(), p.rounds, p.steps),
+    // Any fit but the default has its settings in its name, so it never replaces another.
+    let reduce = if options.prune.is_some() { None } else { options.reduce };
+    let stem = match options.palette {
+        Some(colours) => format!("{name}_{fit_name}_palette{colours}"),
         None => format!("{name}_{fit_name}"),
+    };
+    let stem = match (options.prune, reduce) {
+        (Some(p), _) => format!("{stem}_keep{}_{}_r{}_s{}", p.keep, p.by.name(), p.rounds, p.steps),
+        (None, Some(budget)) if budget == DEFAULT_REDUCE => stem,
+        (None, Some(budget)) => format!("{stem}_reduce{budget}"),
+        (None, None) => format!("{stem}_reduce0"),
     };
     // Every outline of every mask goes through one queue; `masks` remembers
     // plate, level, value and the range of each mask's outlines.
@@ -104,8 +124,24 @@ pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<Fit
     let mut masks = Vec::new();
     let (mut dropped, mut base) = (0, [0.0; 4]);
     let mut levels_json = Vec::new();
+    let mut table = None;
+    if let Some(colours) = options.palette {
+        let stack = palette::stack(&labs, w, h, &palette::kmeans(&labs, colours));
+        dropped += stack.dropped;
+        for (j, loops) in stack.outlines.into_iter().enumerate() {
+            if !loops.is_empty() {
+                masks.push((0, j + 1, (j + 1) as f64, outlines.len()..outlines.len() + loops.len()));
+                outlines.extend(loops);
+            }
+        }
+        levels_json.push(format!("\"palette\":{{\"colours\":{}}}", stack.colours.len()));
+        table = Some(stack.colours.iter().map(|c| lab_to_rgb(c[0], c[1], c[2])).collect::<Vec<_>>());
+    }
     let plates = if alpha.is_some() { PLATES.len() } else { ALPHA };
     for (channel, plate) in PLATES.iter().enumerate().take(plates) {
+        if table.is_some() && channel < ALPHA {
+            continue;
+        }
         let (found_levels, thresholds, found, lost) = match &alpha {
             Some(alpha) if channel == ALPHA => alpha_outlines(alpha.pixels(), w, h, options.levels[channel]),
             _ => {
@@ -131,11 +167,16 @@ pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<Fit
     if let Some(p) = options.prune {
         prune_fits(&outlines, &mut fits, p)?;
     }
+    if let Some(budget) = reduce {
+        reduce_fits(&outlines, &mut fits, budget)?;
+    }
+    let sparse = options.prune.is_some() || reduce.is_some();
     let drawing = Drawing {
         w,
         h,
         base: [base[0], base[1], base[2]],
         alpha: alpha.is_some().then_some(base[ALPHA]),
+        table,
         masks: masks
             .into_iter()
             .map(|(channel, level, value, range)| {
@@ -149,20 +190,24 @@ pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<Fit
         points += f.n;
         total += 2 * f.m + 1;
         let nonzero = f.coefficients.iter().filter(|c| c.re != 0.0 || c.im != 0.0).count();
-        coefficients += if options.prune.is_some() { nonzero } else { 2 * f.m + 1 };
+        coefficients += if sparse { nonzero } else { 2 * f.m + 1 };
         weighted += f.n as f64 * f.loss.sqrt();
     }
-    let prune_json = options.prune.map_or(String::new(), |p| {
-        let share = coefficients as f64 / total as f64;
-        println!("{stem}: kept {coefficients} of {total} coefficients ({:.1}%)", share * 100.0);
-        format!(
-            "\"prune\":{{\"keep\":{},\"by\":\"{}\",\"rounds\":{},\"steps\":{},\"total_coefficients\":{total},\"kept_share\":{share:.6}}},",
-            p.keep,
-            p.by.name(),
-            p.rounds,
-            p.steps
-        )
-    });
+    let share = coefficients as f64 / total as f64;
+    let prune_json = match (options.prune, reduce) {
+        (Some(p), _) => {
+            println!("{stem}: kept {coefficients} of {total} coefficients ({:.1}%)", share * 100.0);
+            format!(
+                "\"prune\":{{\"keep\":{},\"by\":\"{}\",\"rounds\":{},\"steps\":{},\"total_coefficients\":{total},\"kept_share\":{share:.6}}},",
+                p.keep,
+                p.by.name(),
+                p.rounds,
+                p.steps
+            )
+        }
+        (None, Some(budget)) => format!("\"reduce\":{{\"budget\":{budget},\"total_coefficients\":{total},\"kept_share\":{share:.6}}},"),
+        (None, None) => String::new(),
+    };
     // Measured on the rendering that `render` gives at scale 1, so a packed
     // file is measured after its rounding, and transparency over white.
     let reference = match &alpha {
@@ -185,7 +230,7 @@ pub fn fit_image(output: &Path, path: &Path, options: &FitOptions) -> Result<Fit
         }
         None => {
             let file_name = format!("{stem}_coefficients.csv");
-            drawing.write_coefficients(&output.join(&file_name), options.prune.is_some())?;
+            drawing.write_coefficients(&output.join(&file_name), sparse)?;
             (file_name, measure(&drawing.bitmap(1)?, &reference)?, String::new())
         }
     };
@@ -291,7 +336,7 @@ mod tests {
     }
 
     fn dft_options(prune: Option<Prune>) -> FitOptions {
-        FitOptions { factor: Some(1), levels: [4, 3, 3, 4], kind: FitKind::Dft, prune, movement: None }
+        FitOptions { factor: Some(1), levels: [4, 3, 3, 4], kind: FitKind::Dft, prune, reduce: Some(DEFAULT_REDUCE), movement: None, palette: None }
     }
 
     #[test]
@@ -319,13 +364,46 @@ mod tests {
     }
 
     #[test]
+    fn reducing_harmonics_shrinks_the_files_and_stays_readable() {
+        let dir = scratch_dir("reduce");
+        let (picture, path) = blocks(&dir);
+        let reference = eight_bit(&picture).unwrap();
+        let rows = |file: &Path| std::fs::read_to_string(file).unwrap().lines().count() - 1;
+        let run = |reduce: Option<f64>, movement: Option<f64>| fit_image(&dir, &path, &FitOptions { reduce, movement, ..dft_options(None) }).unwrap();
+        // Each setting has its own name, except the default.
+        let (reduced, whole, coarse) = (run(Some(DEFAULT_REDUCE), None), run(None, None), run(Some(0.6), None));
+        assert!(reduced.coefficients.ends_with("blocks_dft_coefficients.csv"), "{:?}", reduced.coefficients);
+        assert!(whole.coefficients.ends_with("blocks_dft_reduce0_coefficients.csv"), "{:?}", whole.coefficients);
+        assert!(coarse.coefficients.ends_with("blocks_dft_reduce0.6_coefficients.csv"), "{:?}", coarse.coefficients);
+        assert!(rows(&coarse.coefficients) < rows(&reduced.coefficients));
+        assert!(rows(&reduced.coefficients) < rows(&whole.coefficients));
+        let text = std::fs::read_to_string(&reduced.summary).unwrap();
+        assert!(text.contains(&format!("\"reduce\":{{\"budget\":{DEFAULT_REDUCE},\"total_coefficients\":{},", rows(&whole.coefficients))), "{text}");
+        assert!(text.contains(&format!("\"coefficients\":{},", rows(&reduced.coefficients))), "{text}");
+        // The sparse CSV reads back and measures as recorded.
+        let written = render(&dir, &reduced.coefficients, 1, None, true).unwrap();
+        let redrawn = bmp::read(&std::fs::read(&written[0]).unwrap()).unwrap();
+        let again = mean_delta_e(&measure(&redrawn, &reference).unwrap());
+        assert!((again - mean_delta_e(&text)).abs() < 1e-3, "{again}");
+        // Packed, it is smaller than the whole fit, and draws the same as recorded.
+        let (small, large) = (run(Some(DEFAULT_REDUCE), Some(0.2)), run(None, Some(0.2)));
+        let size = |file: &Path| std::fs::metadata(file).unwrap().len();
+        assert!(size(&small.coefficients) < size(&large.coefficients));
+        let written = render(&dir, &small.coefficients, 1, None, true).unwrap();
+        let redrawn = bmp::read(&std::fs::read(&written[0]).unwrap()).unwrap();
+        let recorded = mean_delta_e(&std::fs::read_to_string(&small.summary).unwrap());
+        assert!((mean_delta_e(&measure(&redrawn, &reference).unwrap()) - recorded).abs() < 1e-3);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn pruned_fits_are_sparse_and_redraw_as_measured() {
         let dir = scratch_dir("prune");
         let (picture, path) = blocks(&dir);
         let reference = eight_bit(&picture).unwrap();
         let rows = |file: &Path| std::fs::read_to_string(file).unwrap().lines().count() - 1;
-        fit_image(&dir, &path, &dft_options(None)).unwrap();
-        let dense = rows(&dir.join("blocks_dft_coefficients.csv"));
+        fit_image(&dir, &path, &FitOptions { reduce: None, ..dft_options(None) }).unwrap();
+        let dense = rows(&dir.join("blocks_dft_reduce0_coefficients.csv"));
         for (by, tag) in [(PruneBy::Largest, "largest"), (PruneBy::LowPass, "lowpass")] {
             let prune = Prune { keep: 0.5, by, rounds: 2, steps: 20 };
             let summary = fit_image(&dir, &path, &dft_options(Some(prune))).unwrap().summary;
@@ -406,6 +484,28 @@ mod tests {
         let fitted = fit_image(&dir, &path, &options).unwrap();
         assert!(fitted.coefficients.ends_with("blocks_dft_keep0.5_largest_r1_s10_m0.2.fvc"), "{:?}", fitted.coefficients);
         assert!(!render(&dir, &fitted.coefficients, 1, None, true).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_palette_fit_paints_its_colours_without_a_filter() {
+        let dir = scratch_dir("fit-palette");
+        let (picture, path) = blocks(&dir);
+        let options = FitOptions { movement: Some(DEFAULT_MOVEMENT), palette: Some(8), ..dft_options(None) };
+        let fitted = fit_image(&dir, &path, &options).unwrap();
+        assert!(fitted.coefficients.ends_with("blocks_dft_palette8_m0.2.fvc"), "{:?}", fitted.coefficients);
+        let text = std::fs::read_to_string(&fitted.summary).unwrap();
+        assert!(text.contains(r#""palette":{"colours":"#), "{text}");
+        // Three flat colours need few of the eight, and come out close.
+        assert!(mean_delta_e(&text) < 2.0, "{text}");
+        let written = render(&dir, &fitted.coefficients, 1, Some(SvgDetail::default()), true).unwrap();
+        let svg = std::fs::read_to_string(&written[0]).unwrap();
+        assert!(!svg.contains("filter") && !svg.contains("mix-blend-mode") && svg.contains("<path fill=\"#"), "{svg}");
+        let redrawn = bmp::read(&std::fs::read(&written[1]).unwrap()).unwrap();
+        let again = mean_delta_e(&measure(&redrawn, &eight_bit(&picture).unwrap()).unwrap());
+        assert!((again - mean_delta_e(&text)).abs() < 1e-3, "{again} vs {text}");
+        // A table has no CSV.
+        assert!(fit_image(&dir, &path, &FitOptions { movement: None, ..options }).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -5,7 +5,7 @@
 use crate::{fft, outline::signed_area, Complex, Error};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const MAX_HARMONICS: usize = 1024;
+pub(crate) const MAX_HARMONICS: usize = 1024;
 /// Steps of descent when refining the DFT result, and per coarse-to-fine
 /// stage when starting from a circle.
 const REFINE_STEPS: usize = 200;

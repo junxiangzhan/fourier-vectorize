@@ -1,9 +1,15 @@
 //! Pruning: dropping coefficients and descending on the rest, which shrinks
 //! the coefficients file at some cost in accuracy.
 use crate::{
-    fit::{chamfer, in_queue, Fit, KdTree, RATE},
+    fit::{chamfer, in_queue, samples, Fit, KdTree, RATE},
     Complex, Error,
 };
+
+/// How far past its RMS budget a reduced curve may stray at any one point.
+const WORST_REDUCED: f64 = 4.0;
+/// Steps of descent after reducing a curve's harmonics. Measured on two
+/// paintings, these get all that more steps do, and most of it comes early.
+const REDUCED_STEPS: usize = 20;
 
 /// Which coefficients pruning keeps.
 #[derive(Clone, Copy, PartialEq)]
@@ -110,6 +116,51 @@ fn descend_kept(outlines: &[Vec<Complex>], fits: &mut [Fit], live: &[Vec<bool>],
     Ok(())
 }
 
+/// The fewest harmonics of a curve that stay within `budget` of it, as an RMS
+/// in pixels, and within `WORST_REDUCED` times that at every sample. Dropping
+/// harmonics moves a curve evenly sampled in t by the RMS of what they sum to,
+/// so the tail's energy gives the answer without drawing it.
+fn fewest_harmonics(fit: &Fit, budget: f64) -> Result<usize, Error> {
+    let (m, c) = (fit.m, &fit.coefficients);
+    let (mut top, mut tail) = (m, 0.0);
+    while top > 1 {
+        let wider = tail + c[m - top].norm_squared() + c[m + top].norm_squared();
+        if wider > budget * budget {
+            break;
+        }
+        tail = wider;
+        top -= 1;
+    }
+    let whole = samples(c, m, fit.s)?;
+    while top < m {
+        let mut kept = c.clone();
+        kept[..m - top].fill(Complex::ZERO);
+        kept[m + top + 1..].fill(Complex::ZERO);
+        let worst = samples(&kept, m, fit.s)?.iter().zip(&whole).map(|(a, b)| (*a - *b).norm_squared()).fold(0.0, f64::max);
+        if worst.sqrt() <= WORST_REDUCED * budget {
+            break;
+        }
+        top = (top + top / 4 + 1).min(m);
+    }
+    Ok(top)
+}
+
+/// Gives each curve only the harmonics it needs, as `fewest_harmonics` finds,
+/// then descends on those. Dropped coefficients end up exactly zero.
+pub(crate) fn reduce_fits(outlines: &[Vec<Complex>], fits: &mut [Fit], budget: f64) -> Result<(), Error> {
+    let order: Vec<usize> = (0..fits.len()).collect();
+    let current: &[Fit] = fits;
+    let tops = in_queue(&order, |i| fewest_harmonics(&current[i], budget))?;
+    let mut live = Vec::with_capacity(fits.len());
+    for (f, top) in fits.iter_mut().zip(tops) {
+        let m = f.m;
+        f.coefficients[..m - top].fill(Complex::ZERO);
+        f.coefficients[m + top + 1..].fill(Complex::ZERO);
+        live.push((0..2 * m + 1).map(|i| (i as i64 - m as i64).unsigned_abs() as usize <= top).collect());
+    }
+    descend_kept(outlines, fits, &live, REDUCED_STEPS)
+}
+
 /// Prunes each fit: cut, descend, and so on, as `prune` says. Dropped
 /// coefficients end up exactly zero.
 pub(crate) fn prune_fits(outlines: &[Vec<Complex>], fits: &mut [Fit], prune: Prune) -> Result<(), Error> {
@@ -133,6 +184,82 @@ pub(crate) fn prune_fits(outlines: &[Vec<Complex>], fits: &mut [Fit], prune: Pru
 mod tests {
     use super::*;
     use crate::{fit::fit_all, FitKind};
+
+    /// A ring with a large slow wave and a small fast one, at harmonics 5 and 40.
+    fn wavy_ring(fast: f64) -> Vec<Complex> {
+        (0..600)
+            .map(|i| {
+                let a = i as f64 / 600.0 * std::f64::consts::TAU;
+                let r = 50.0 + 6.0 * (5.0 * a).sin() + fast * (40.0 * a).sin();
+                Complex::new(60.0 + r * a.cos(), 60.0 + r * a.sin())
+            })
+            .collect()
+    }
+
+    fn top_of(f: &Fit) -> usize {
+        (0..=f.m).rev().find(|k| f.coefficients[f.m + k].abs() > 0.0 || f.coefficients[f.m - k].abs() > 0.0).unwrap()
+    }
+
+    #[test]
+    fn a_curve_keeps_only_the_harmonics_its_budget_needs() {
+        let outlines = vec![wavy_ring(0.0), wavy_ring(0.5)];
+        let mut fits = fit_all(&outlines, FitKind::Dft).unwrap();
+        let (m, whole) = (fits[0].m, fits[0].coefficients.clone());
+        let before: Vec<f64> = fits.iter().map(|f| f.loss).collect();
+        reduce_fits(&outlines, &mut fits, 0.1).unwrap();
+        // The smooth ring needs its slow wave and little else; a fast wave worth more than the budget stays.
+        assert!(top_of(&fits[0]) < 20 && top_of(&fits[0]) >= 4, "{}", top_of(&fits[0]));
+        assert!(top_of(&fits[1]) >= 39 && top_of(&fits[1]) < m / 2, "{}", top_of(&fits[1]));
+        // What is dropped is exactly zero.
+        let top = top_of(&fits[0]);
+        assert!(fits[0].coefficients[..m - top].iter().all(|c| c.re == 0.0 && c.im == 0.0));
+        // Descent brings what is kept closer to the outline than cutting alone leaves it.
+        let mut cut = whole.clone();
+        cut[..m - top].fill(Complex::ZERO);
+        cut[m + top + 1..].fill(Complex::ZERO);
+        let tree = KdTree::new(&outlines[0]);
+        let (cut_loss, _) = chamfer(&cut, m, fits[0].s, &outlines[0], &tree).unwrap();
+        assert!(fits[0].loss <= cut_loss, "{} vs {cut_loss}", fits[0].loss);
+        // It lies no further from the outline than the budget adds. Descent slides
+        // samples along the curve, so this is the distance to compare, not sample by sample.
+        for (f, was) in fits.iter().zip(&before) {
+            assert!(f.loss.sqrt() <= was.sqrt() + 0.1, "{} from {}", f.loss.sqrt(), was.sqrt());
+        }
+    }
+
+    #[test]
+    fn no_budget_is_too_small_or_too_large_for_a_curve() {
+        let outlines = vec![wavy_ring(0.5)];
+        // Too small to drop anything worth keeping, whatever is rounding-sized aside.
+        let mut fits = fit_all(&outlines, FitKind::Dft).unwrap();
+        let m = fits[0].m;
+        reduce_fits(&outlines, &mut fits, 1e-12).unwrap();
+        assert!(top_of(&fits[0]) >= 40 && top_of(&fits[0]) <= m);
+        // So large that all could go: the curve still has k = -1, 0 and 1.
+        let mut fits = fit_all(&outlines, FitKind::Dft).unwrap();
+        fits[0].coefficients[m + 1] = Complex::new(50.0, 0.0);
+        reduce_fits(&outlines, &mut fits, 1e6).unwrap();
+        assert_eq!(top_of(&fits[0]), 1);
+    }
+
+    #[test]
+    fn a_sharp_spike_keeps_more_than_the_rms_alone_would_allow() {
+        // One corner far out on a long ring: small in RMS, large at that one place.
+        let mut points = wavy_ring(0.0);
+        points[300] = points[300] + Complex::new(-3.0, 0.0);
+        let outlines = vec![points];
+        let mut fits = fit_all(&outlines, FitKind::Dft).unwrap();
+        let (m, c, s) = (fits[0].m, fits[0].coefficients.clone(), fits[0].s);
+        let budget = 0.2;
+        let top = fewest_harmonics(&fits[0], budget).unwrap();
+        let mut kept = c.clone();
+        kept[..m - top].fill(Complex::ZERO);
+        kept[m + top + 1..].fill(Complex::ZERO);
+        let (a, b) = (samples(&kept, m, s).unwrap(), samples(&c, m, s).unwrap());
+        let worst = a.iter().zip(&b).map(|(x, y)| (*x - *y).abs()).fold(0.0, f64::max);
+        assert!(worst <= WORST_REDUCED * budget || top == m, "{worst} at {top}");
+        reduce_fits(&outlines, &mut fits, budget).unwrap();
+    }
 
     #[test]
     fn the_rounds_reach_the_same_share_and_the_steps_all_run() {
